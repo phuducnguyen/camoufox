@@ -1,0 +1,29 @@
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -9975,6 +9975,14 @@
+     aStyle.systemFont = true;
+     return;
+   }
++  if (aOS == MaskConfig::SpoofedOS::Android) {
++    // Firefox for Android's system face. The size is a stand-in until a
++    // capture from the exact Android build supplies the per-keyword table.
++    aName = u"Roboto"_ns;
++    aStyle.size = 16.0f;
++    aStyle.systemFont = true;
++    return;
++  }
+   if (aOS == MaskConfig::SpoofedOS::Linux) {
+     // A stock Ubuntu desktop: GTK interface font "Ubuntu 11" (11pt = 14.6667
+     // CSS px). Upstream's RFP value for Linux ("sans-serif" 15px) is what a
+diff --git a/layout/style/nsMediaFeatures.cpp b/layout/style/nsMediaFeatures.cpp
+--- a/layout/style/nsMediaFeatures.cpp
++++ b/layout/style/nsMediaFeatures.cpp
+@@ -186,3 +186,7 @@
+ float Gecko_MediaFeatures_GetResolution(const Document* aDocument) {
++  if (auto dpr = MaskConfig::GetDouble("window.devicePixelRatio");
++      dpr && *dpr > 0) {
++    return static_cast<float>(*dpr);
++  }
+   // We're returning resolution in terms of device pixels per css pixel, since
+   // that is the preferred unit for media queries of resolution. This avoids

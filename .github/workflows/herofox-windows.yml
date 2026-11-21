@@ -1,0 +1,117 @@
+name: HeroFox Windows engine
+
+# Build one Windows x86_64 Camoufox archive from a chosen source ref. Used for the
+# HeroFox Android patch: run the unmodified tag first as a baseline, then the
+# patched branch. No release is published; the workflow uploads the dist files.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Camoufox tag or branch to build"
+        required: true
+        default: "v158.0-beta.40"
+      apply_patch:
+        description: "Apply browser/patches/herofox-android.patch after prepare"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      PYTHON_VERSION: "3.12"
+      BUILD_TARGET: windows,x86_64
+    steps:
+      - name: Maximize build space
+        uses: AdityaGarg8/remove-unwanted-software@8831c82abf29b34eb2caac48d5f999ecfc0d8eef
+        with:
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+          remove-cached-tools: "true"
+          remove-swapfile: "true"
+          verbose: "false"
+
+      - name: Remove unwanted tools
+        run: |
+          sudo apt-get remove -y '^aspnetcore-.*' > /dev/null
+          sudo apt-get remove -y '^dotnet-.*' > /dev/null
+          sudo apt-get remove -y '^llvm-.*' > /dev/null
+          sudo apt-get remove -y 'php.*' > /dev/null
+          sudo apt-get remove -y '^mongodb-.*' > /dev/null
+          sudo apt-get remove -y '^mysql-.*' > /dev/null
+          sudo apt-get remove -y azure-cli google-chrome-stable firefox mono-devel libgl1-mesa-dri --fix-missing > /dev/null
+          sudo apt-get autoremove -y > /dev/null
+          sudo apt-get clean > /dev/null
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up LLVM
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 18
+          sudo apt-get install -y lld-18 clang-18 libc6-i386 lib32gcc-s1 lib32stdc++6 gcc-multilib g++-multilib
+          sudo update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/ld.lld-18 100
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y msitools p7zip-full aria2 ccache fontconfig
+
+      - name: Fetch the font bundle
+        working-directory: browser
+        run: make fonts-extract
+
+      - name: Verify the font bundle
+        working-directory: browser
+        run: |
+          python3 -m pip install -e ../python
+          python3 scripts/verify-fonts.py
+
+      - name: Prepare the source tree
+        run: python3 -m ci.run_prepare
+
+      - name: Apply the HeroFox Android patch
+        if: inputs.apply_patch == 'true'
+        working-directory: browser
+        run: |
+          src=$(find . -maxdepth 1 -type d -name 'camoufox-*' | head -1)
+          test -n "$src"
+          patch -p1 -d "$src" -i patches/herofox-android.patch
+
+      - name: Resolve the uBlock Origin pin
+        run: echo "CAMOUFOX_UBO=$(python3 browser/scripts/fetch-ubo.py resolve)" >> "$GITHUB_ENV"
+
+      - name: Create swap space
+        run: |
+          sudo fallocate -l 24G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h /
+
+      - name: Build
+        env:
+          CARGO_BUILD_JOBS: "1"
+        working-directory: browser
+        run: python3 ./multibuild.py --target windows --arch x86_64
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: HeroFoxWindows-${{ inputs.ref }}
+          path: browser/dist/*
+          if-no-files-found: error
