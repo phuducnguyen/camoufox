@@ -70,3 +70,28 @@ diff --git a/gfx/thebes/gfxPlatformFontList.h b/gfx/thebes/gfxPlatformFontList.h
        mSpoofedSystemUIPrefFonts MOZ_GUARDED_BY(mLock);
  
    // When system-wide font lookup fails for a character, cache it to skip future
+diff --git a/toolkit/components/resistfingerprinting/nsRFPService.cpp b/toolkit/components/resistfingerprinting/nsRFPService.cpp
+--- a/toolkit/components/resistfingerprinting/nsRFPService.cpp
++++ b/toolkit/components/resistfingerprinting/nsRFPService.cpp
+@@ -4,10 +4,16 @@
+                                                    const nsAString& aPlatform) {
+   const bool isWindows = StringBeginsWith(aPlatform, u"Win"_ns);
+   const bool isMac = StringBeginsWith(aPlatform, u"Mac"_ns);
+-  // Linux, Android and other platforms have no offset.
+-  int spoofedHeightOffset = aIsFullscreen ? 0
+-                            : isWindows   ? 48
+-                            : isMac       ? 76
+-                                          : 0;
++  // A Linux desktop reserves the GTK top bar (27 px at 100%, the value the
++  // presets use). An Android identity presents a "Linux armv8" platform and a
++  // phone's screen is the whole display, so it keeps the zero offset.
++  const bool isLinuxDesktop =
++      StringBeginsWith(aPlatform, u"Linux"_ns) &&
++      !StringBeginsWith(aPlatform, u"Linux armv"_ns);
++  int spoofedHeightOffset = aIsFullscreen    ? 0
++                            : isWindows      ? 48
++                            : isMac          ? 76
++                            : isLinuxDesktop ? 27
++                                             : 0;
+   spoofedHeightOffset =
+       NS_lround(float(spoofedHeightOffset) / aScale * AppUnitsPerCSSPixel());
