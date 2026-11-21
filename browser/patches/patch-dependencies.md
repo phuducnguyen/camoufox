@@ -19,7 +19,9 @@ for process-wide decisions only (`font-hijacker.patch`'s bundled fonts, the
 WebRTC host socket's port range in `webrtc-ip-spoofing.patch`); anything a page
 can observe asks `NavigatorManager::GetSpoofedOS()` (`navigator-spoofing.patch`)
 for its own context's OS, which is that context's `navigator.platform` when it
-set one and the launch's otherwise.
+set one and the launch's otherwise. A `Linux armv8*` platform is
+`SpoofedOS::Android`: it presents as Linux to pages but takes Android's system
+font, system-ui family and ephemeral-port range, not Ubuntu's.
 `scripts/copy-additions.sh` copies it into the source tree before any patch
 applies. A patch that calls MaskConfig from a directory whose `moz.build` does
 not already see `/camoucfg` must add `LOCAL_INCLUDES += ["/camoucfg"]` itself.
@@ -69,6 +71,7 @@ already set up, and do not add the include or `LOCAL_INCLUDES` themselves:
 | `font-list-spoofing.patch` | `anti-font-fingerprinting.patch` for `gfxFontGroup::mUserContextId` |
 | `timezone-spoofing.patch`, `webrtc-ip-spoofing.patch` | `audio-fingerprint-manager.patch` for `RoverfoxStorageManager.h` in `dom/base/nsGlobalWindowInner.cpp` |
 | `font-system-fonts-css2.patch`, `system-ui-font-spoofing.patch`, `webrtc-ip-spoofing.patch` | `navigator-spoofing.patch` for `NavigatorManager::GetSpoofedOS()` |
+| `zz-herofox-android.patch` | `font-system-fonts-css2.patch` for `GetSpoofedSystemFontForRFP` in `layout/base/nsLayoutUtils.cpp`; `screen-spoofing.patch` for `MaskConfig.hpp` in `layout/style/nsMediaFeatures.cpp`; `system-ui-font-spoofing.patch` for `GetSystemUIFontFamilies` and its per-OS cache array |
 
 ## RoverfoxStorageManager
 

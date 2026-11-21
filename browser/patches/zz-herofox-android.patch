@@ -1,0 +1,72 @@
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -9930,4 +9930,15 @@
+     aStyle.systemFont = true;
+     return;
+   }
++  if (aOS == MaskConfig::SpoofedOS::Android) {
++    // Android's system face. Firefox for Android resolves every CSS2 system
++    // font keyword to the platform UI font, Roboto; the size is the default
++    // 16sp at a density-independent scale. CreepJS reads this family from
++    // getComputedStyle() and attributes it to an OS, so a Linux family here
++    // ("Ubuntu") marks the identity as Linux, not Android.
++    aName = u"Roboto"_ns;
++    aStyle.size = 16.0f;
++    aStyle.systemFont = true;
++    return;
++  }
+   if (aOS == MaskConfig::SpoofedOS::Linux) {
+diff --git a/layout/style/nsMediaFeatures.cpp b/layout/style/nsMediaFeatures.cpp
+--- a/layout/style/nsMediaFeatures.cpp
++++ b/layout/style/nsMediaFeatures.cpp
+@@ -193,6 +193,14 @@
+   // introducing precision error from conversion to and from less-used
+   // physical units like inches.
+   nsPresContext* pc = aDocument->GetPresContext();
++  // Camoufox: the launch config pins window.devicePixelRatio; the resolution
++  // media feature (and (min-/max-)resolution, the dppx aliases) has to report
++  // the same ratio or a detector sees the two disagree ("lied dpr"). Zoom is
++  // applied the way nsGlobalWindowInner::GetDevicePixelRatio applies it.
++  if (auto dpr = MaskConfig::GetDouble("window.devicePixelRatio");
++      dpr && *dpr > 0) {
++    return static_cast<float>(*dpr) / (pc ? pc->GetFullZoom() : 1.0f);
++  }
+   if (!pc) {
+     return 1.;
+   }
+diff --git a/gfx/thebes/gfxPlatformFontList.cpp b/gfx/thebes/gfxPlatformFontList.cpp
+--- a/gfx/thebes/gfxPlatformFontList.cpp
++++ b/gfx/thebes/gfxPlatformFontList.cpp
+@@ -2243,6 +2243,7 @@
+ #ifndef XP_WIN
+     case SpoofedOS::Windows:
+ #endif
++    case SpoofedOS::Android:
+     case SpoofedOS::Linux:
+       return os;
+     default:
+@@ -2259,6 +2260,11 @@
+       return;
+     case MaskConfig::SpoofedOS::Windows:
+       *aFamilies.AppendElement() = "Segoe UI"_ns;
++      return;
++    case MaskConfig::SpoofedOS::Android:
++      // Firefox for Android's system-ui face; the CSS2 keywords are in
++      // the same patch.
++      *aFamilies.AppendElement() = "Roboto"_ns;
+       return;
+     case MaskConfig::SpoofedOS::Linux:
+       // The GTK interface font of a stock Ubuntu desktop; see
+diff --git a/gfx/thebes/gfxPlatformFontList.h b/gfx/thebes/gfxPlatformFontList.h
+--- a/gfx/thebes/gfxPlatformFontList.h
++++ b/gfx/thebes/gfxPlatformFontList.h
+@@ -1068,7 +1068,7 @@
+   // MaskConfig::SpoofedOS (GetPrefFontsLangGroupLocked).
+   std::array<mozilla::RangedArray<mozilla::UniquePtr<PrefFontList>,
+                                   eFontPrefLang_First, eFontPrefLang_Count>,
+-             5>
++             6>
+       mSpoofedSystemUIPrefFonts MOZ_GUARDED_BY(mLock);
+ 
+   // When system-wide font lookup fails for a character, cache it to skip future
