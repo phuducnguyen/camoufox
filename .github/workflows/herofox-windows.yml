@@ -10,6 +10,10 @@ on:
         description: "Camoufox tag or branch to build"
         required: true
         default: "v158.0-beta.40"
+      apply_patch:
+        description: "Apply browser/patches/herofox-android.patch after prepare"
+        required: false
+        default: "false"
 
 permissions:
   contents: read
@@ -78,6 +82,14 @@ jobs:
 
       - name: Prepare the source tree
         run: python3 -m ci.run_prepare
+
+      - name: Apply the HeroFox Android patch
+        if: inputs.apply_patch == 'true'
+        working-directory: browser
+        run: |
+          src=$(find . -maxdepth 1 -type d -name 'camoufox-*' | head -1)
+          test -n "$src"
+          patch -p1 -d "$src" -i patches/herofox-android.patch
 
       - name: Resolve the uBlock Origin pin
         run: echo "CAMOUFOX_UBO=$(python3 browser/scripts/fetch-ubo.py resolve)" >> "$GITHUB_ENV"
