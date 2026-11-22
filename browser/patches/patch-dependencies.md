@@ -71,7 +71,7 @@ already set up, and do not add the include or `LOCAL_INCLUDES` themselves:
 | `font-list-spoofing.patch` | `anti-font-fingerprinting.patch` for `gfxFontGroup::mUserContextId` |
 | `timezone-spoofing.patch`, `webrtc-ip-spoofing.patch` | `audio-fingerprint-manager.patch` for `RoverfoxStorageManager.h` in `dom/base/nsGlobalWindowInner.cpp` |
 | `font-system-fonts-css2.patch`, `system-ui-font-spoofing.patch`, `webrtc-ip-spoofing.patch` | `navigator-spoofing.patch` for `NavigatorManager::GetSpoofedOS()` |
-| `zz-herofox-android.patch` | `font-system-fonts-css2.patch` for `GetSpoofedSystemFontForRFP` in `layout/base/nsLayoutUtils.cpp`; `screen-spoofing.patch` for `MaskConfig.hpp` in `layout/style/nsMediaFeatures.cpp` and the platform-aware `GetSpoofedScreenAvailSize` in `toolkit/components/resistfingerprinting/nsRFPService.cpp`; `system-ui-font-spoofing.patch` for `GetSystemUIFontFamilies` and its per-OS cache array |
+| `zz-herofox-android.patch` | `font-system-fonts-css2.patch` for `GetSpoofedSystemFontForRFP` in `layout/base/nsLayoutUtils.cpp`; `screen-spoofing.patch` for `MaskConfig.hpp` in `layout/style/nsMediaFeatures.cpp`, the platform-aware `GetSpoofedScreenAvailSize` in `toolkit/components/resistfingerprinting/nsRFPService.cpp`, and `nsScreen::GetAvailRect`; `system-ui-font-spoofing.patch` for `GetSystemUIFontFamilies` and its per-OS cache array |
 
 ## RoverfoxStorageManager
 
