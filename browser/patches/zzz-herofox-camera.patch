@@ -1,0 +1,769 @@
+diff --git a/dom/media/systemservices/FakeVideoSource.cpp b/dom/media/systemservices/FakeVideoSource.cpp
+index 576a321..d21f58e 100644
+--- a/dom/media/systemservices/FakeVideoSource.cpp
++++ b/dom/media/systemservices/FakeVideoSource.cpp
+@@ -10,6 +10,10 @@
+ #include "mozilla/SyncRunnable.h"
+ #include "mozilla/gfx/Tools.h"
+ 
++#ifdef XP_WIN
++#  include "HeroCameraPipe.h"
++#endif
++
+ #ifdef MOZ_WEBRTC
+ #  include "common/YuvStamper.h"
+ #  include "prtime.h"
+@@ -24,10 +28,24 @@ FakeVideoSource::FakeVideoSource(nsISerialEventTarget* aTarget)
+ 
+ FakeVideoSource::~FakeVideoSource() = default;
+ 
++#ifdef XP_WIN
++void FakeVideoSource::SetCameraPipe(const nsAString& aName) {
++  mTarget.AssertOnCurrentThread();
++  mPipeName = aName;
++}
++#endif
++
+ int32_t FakeVideoSource::StartCapture(int32_t aWidth, int32_t aHeight,
+                                       const TimeDuration& aFrameInterval) {
+   MutexAutoLock lock(mMutex);
+ 
++#ifdef XP_WIN
++  if (!mPipeName.IsEmpty()) {
++    StartPipeCapture(aWidth, aHeight, aFrameInterval);
++    return 0;
++  }
++#endif
++
+   mTimer = NS_NewTimer(mTarget.GetEventTarget());
+   if (!mTimer) {
+     return -1;
+@@ -103,9 +121,79 @@ int32_t FakeVideoSource::StartCapture(int32_t aWidth, int32_t aHeight,
+   return 0;
+ }
+ 
++#ifdef XP_WIN
++void FakeVideoSource::StartPipeCapture(int32_t aWidth, int32_t aHeight,
++                                       const TimeDuration& aFrameInterval) {
++  mTarget.AssertOnCurrentThread();
++  MOZ_ASSERT(aWidth > 0 && aHeight > 0);
++  MOZ_ASSERT((aWidth & 1) == 0 && (aHeight & 1) == 0);
++
++  const size_t yLen = static_cast<size_t>(aWidth) * aHeight;
++  nsTArray<uint8_t> frame;
++  if (!frame.SetLength(yLen + yLen / 2, fallible)) {
++    return;
++  }
++
++  auto data = std::make_unique<layers::PlanarYCbCrData>();
++  data->mYChannel = frame.Elements();
++  data->mYStride = aWidth;
++  data->mCbCrStride = aWidth / 2;
++  data->mCbChannel = data->mYChannel + yLen;
++  data->mCrChannel = data->mCbChannel + yLen / 4;
++  data->mPictureRect = IntRect(0, 0, aWidth, aHeight);
++  data->mStereoMode = StereoMode::MONO;
++  data->mYUVColorSpace = gfx::YUVColorSpace::BT601;
++  data->mChromaSubsampling = gfx::ChromaSubsampling::HALF_WIDTH_AND_HEIGHT;
++
++  MOZ_ALWAYS_SUCCEEDS(mTarget.Dispatch(NS_NewRunnableFunction(
++      "FakeVideoSource::StartPipeCapture",
++      [self = RefPtr(this), this, aWidth, aHeight, frame = std::move(frame),
++       data = std::move(data)]() mutable {
++        mTarget.AssertOnCurrentThread();
++        if (!mImageContainer) {
++          mImageContainer = MakeAndAddRef<layers::ImageContainer>(
++              layers::ImageUsageType::Webrtc,
++              layers::ImageContainer::ASYNCHRONOUS);
++        }
++        mWidth = aWidth;
++        mHeight = aHeight;
++        mFrame = std::move(frame);
++        mFrameData = std::move(data);
++      })));
++
++  // The reader keeps the latest complete frame; the timer publishes it at the
++  // camera's rate, the same way the generated pattern is published.
++  mPipe = new HeroCameraPipe(mPipeName);
++  mPipe->Start(static_cast<uint32_t>(aWidth), static_cast<uint32_t>(aHeight));
++
++  mTimer = NS_NewTimer(mTarget.GetEventTarget());
++  if (!mTimer) {
++    mPipe->Stop();
++    mPipe = nullptr;
++    return;
++  }
++  mTimer->InitHighResolutionWithNamedFuncCallback(
++      [](nsITimer* aTimer, void* aClosure) {
++        RefPtr<FakeVideoSource> capturer =
++            static_cast<FakeVideoSource*>(aClosure);
++        capturer->mTarget.AssertOnCurrentThread();
++        capturer->GenerateImage();
++      },
++      this, aFrameInterval, nsITimer::TYPE_REPEATING_PRECISE_CAN_SKIP,
++      "FakeVideoSource::GenerateCameraFrame"_ns);
++}
++#endif
++
+ int32_t FakeVideoSource::StopCapture() {
+   MutexAutoLock lock(mMutex);
+ 
++#ifdef XP_WIN
++  if (mPipe) {
++    mPipe->Stop();
++    mPipe = nullptr;
++  }
++#endif
++
+   if (!mTimer) {
+     return 0;
+   }
+@@ -161,12 +249,32 @@ void FakeVideoSource::GenerateImage() {
+ 
+   RefPtr<layers::PlanarYCbCrImage> ycbcr_image =
+       mImageContainer->CreatePlanarYCbCrImage();
++
++  bool patternFrame = true;
++#ifdef XP_WIN
++  if (mPipe) {
++    // The launcher already applied rotation, zoom, pan and mirror to the frame.
++    patternFrame = false;
++    if (!mPipe->CopyLatest(mFrame, &mWidth, &mHeight)) {
++      return;
++    }
++    const size_t pipeYLen = static_cast<size_t>(mWidth) * mHeight;
++    mFrameData->mYChannel = mFrame.Elements();
++    mFrameData->mYStride = mWidth;
++    mFrameData->mCbCrStride = mWidth / 2;
++    mFrameData->mCbChannel = mFrameData->mYChannel + pipeYLen;
++    mFrameData->mCrChannel = mFrameData->mCbChannel + pipeYLen / 4;
++    mFrameData->mPictureRect = IntRect(0, 0, mWidth, mHeight);
++  }
++#endif
++
+   const size_t yLen = mFrameData->mCbChannel - mFrameData->mYChannel;
+   const size_t cbLen = mFrameData->mCrChannel - mFrameData->mCbChannel;
+   const size_t crLen = cbLen;
+   MOZ_RELEASE_ASSERT(mFrame.Length() == yLen + cbLen + crLen);
+ 
+-  if (StaticPrefs::media_getusermedia_camera_fake_rotation_test_pattern()) {
++  if (patternFrame) {
++    if (StaticPrefs::media_getusermedia_camera_fake_rotation_test_pattern()) {
+     // Static test pattern: red background + blue bottom-right quadrant.
+     // BT.601 limited-range values:  red Y=81 Cb=90 Cr=240, blue Y=41 Cb=240
+     // Cr=110. The quadrant (rather than a fixed-size marker) scales safely
+@@ -220,13 +328,15 @@ void FakeVideoSource::GenerateImage() {
+     memset(mFrame.Elements(), 0x80, yLen);
+     memset(mFrame.Elements() + yLen, mCb, cbLen);
+     memset(mFrame.Elements() + yLen + cbLen, mCr, crLen);
++    }
+   }
+ 
+ #ifdef MOZ_WEBRTC
+   // The stamp is a per-frame value written over the luma plane, so it defeats
+   // the whole point of the static test pattern. Anything comparing frames
+   // against a fixed reference needs it gone.
+-  if (!StaticPrefs::media_getusermedia_camera_fake_rotation_test_pattern()) {
++  if (patternFrame &&
++      !StaticPrefs::media_getusermedia_camera_fake_rotation_test_pattern()) {
+     uint64_t timestamp = PR_Now();
+     YuvStamper::Encode(mWidth, mHeight, mWidth, mFrameData->mYChannel,
+                        reinterpret_cast<unsigned char*>(&timestamp),
+@@ -241,18 +351,20 @@ void FakeVideoSource::GenerateImage() {
+   }
+ 
+   VideoRotation rotation = VideoRotation::kDegree_0;
+-  switch (StaticPrefs::media_getusermedia_camera_fake_rotation()) {
+-    case 90:
+-      rotation = VideoRotation::kDegree_90;
+-      break;
+-    case 180:
+-      rotation = VideoRotation::kDegree_180;
+-      break;
+-    case 270:
+-      rotation = VideoRotation::kDegree_270;
+-      break;
+-    default:
+-      break;
++  if (patternFrame) {
++    switch (StaticPrefs::media_getusermedia_camera_fake_rotation()) {
++      case 90:
++        rotation = VideoRotation::kDegree_90;
++        break;
++      case 180:
++        rotation = VideoRotation::kDegree_180;
++        break;
++      case 270:
++        rotation = VideoRotation::kDegree_270;
++        break;
++      default:
++        break;
++    }
+   }
+ 
+   mGeneratedImageEvent.Notify(ycbcr_image, now, rotation);
+diff --git a/dom/media/systemservices/FakeVideoSource.h b/dom/media/systemservices/FakeVideoSource.h
+index 7431ded..e4f3b48 100644
+--- a/dom/media/systemservices/FakeVideoSource.h
++++ b/dom/media/systemservices/FakeVideoSource.h
+@@ -12,6 +12,7 @@
+ #include "mozilla/Maybe.h"
+ #include "mozilla/Mutex.h"
+ #include "mozilla/ThreadSafety.h"
++#include "nsString.h"
+ 
+ class nsITimer;
+ 
+@@ -21,6 +22,9 @@ class TimeDurationValueCalculator;
+ template <typename T>
+ class BaseTimeDuration;
+ typedef BaseTimeDuration<TimeDurationValueCalculator> TimeDuration;
++#ifdef XP_WIN
++class HeroCameraPipe;
++#endif
+ namespace layers {
+ class Image;
+ class ImageContainer;
+@@ -37,6 +41,11 @@ class FakeVideoSource {
+   int32_t StopCapture();
+   bool CaptureStarted();
+   void SetTrackingId(uint32_t aTrackingIdProcId);
++#ifdef XP_WIN
++  /// Hero Browser: take frames from the launcher's named pipe instead of drawing
++  /// the test pattern. Call before StartCapture.
++  void SetCameraPipe(const nsAString& aName);
++#endif
+ 
+   MediaEventSource<RefPtr<layers::Image>, TimeStamp, VideoRotation>&
+   GeneratedImageEvent() {
+@@ -50,6 +59,10 @@ class FakeVideoSource {
+    * Called by mTimer when it's time to generate a new image.
+    */
+   void GenerateImage() MOZ_REQUIRES(mTarget);
++#ifdef XP_WIN
++  void StartPipeCapture(int32_t aWidth, int32_t aHeight,
++                        const TimeDuration& aFrameInterval);
++#endif
+ 
+   Mutex mMutex{"FakeVideoSource::mMutex"};
+   nsCOMPtr<nsITimer> mTimer MOZ_GUARDED_BY(mMutex);
+@@ -66,6 +79,10 @@ class FakeVideoSource {
+   int32_t mHeight MOZ_GUARDED_BY(mTarget) = -1;
+   int mCb MOZ_GUARDED_BY(mTarget) = 16;
+   int mCr MOZ_GUARDED_BY(mTarget) = 16;
++#ifdef XP_WIN
++  RefPtr<HeroCameraPipe> mPipe MOZ_GUARDED_BY(mTarget);
++  nsString mPipeName MOZ_GUARDED_BY(mTarget);
++#endif
+ };
+ }  // namespace mozilla
+ 
+diff --git a/dom/media/systemservices/HeroCameraPipe.cpp b/dom/media/systemservices/HeroCameraPipe.cpp
+new file mode 100644
+index 0000000..464b0cc
+--- /dev/null
++++ b/dom/media/systemservices/HeroCameraPipe.cpp
+@@ -0,0 +1,195 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "HeroCameraPipe.h"
++
++#ifdef XP_WIN
++#  include <windows.h>
++
++#  include <cstring>
++
++#  include "mozilla/RefPtr.h"
++#  include "mozilla/fallible.h"
++#endif
++
++namespace mozilla {
++
++#ifdef XP_WIN
++namespace {
++
++constexpr size_t kHeaderLength = 24;
++constexpr uint32_t kMaxWidth = 1920;
++constexpr uint32_t kMaxHeight = 1080;
++// The launcher creates the pipe before the engine starts; this only covers the
++// gap while its producer thread is being scheduled.
++constexpr int kConnectAttempts = 400;
++
++bool ReadExact(HANDLE aHandle, uint8_t* aData, size_t aLength) {
++  size_t read = 0;
++  while (read < aLength) {
++    DWORD chunk = 0;
++    if (!ReadFile(aHandle, aData + read, static_cast<DWORD>(aLength - read),
++                  &chunk, nullptr)) {
++      return false;
++    }
++    if (chunk == 0) {
++      return false;
++    }
++    read += chunk;
++  }
++  return true;
++}
++
++uint32_t LittleEndian32(const uint8_t* aData) {
++  return static_cast<uint32_t>(aData[0]) |
++         (static_cast<uint32_t>(aData[1]) << 8) |
++         (static_cast<uint32_t>(aData[2]) << 16) |
++         (static_cast<uint32_t>(aData[3]) << 24);
++}
++
++}  // namespace
++#endif
++
++HeroCameraPipe::HeroCameraPipe(const nsAString& aName)
++#ifdef XP_WIN
++    : mName(aName)
++#endif
++{
++#ifndef XP_WIN
++  (void)aName;
++#endif
++}
++
++HeroCameraPipe::~HeroCameraPipe() { Stop(); }
++
++void HeroCameraPipe::Start(uint32_t aWidth, uint32_t aHeight) {
++#ifdef XP_WIN
++  if (mThread) {
++    return;
++  }
++  mStop = false;
++  mExpectedWidth = aWidth;
++  mExpectedHeight = aHeight;
++  {
++    MutexAutoLock lock(mMutex);
++    mHasFrame = false;
++  }
++  mThread = PR_CreateThread(PR_USER_THREAD, &HeroCameraPipe::ReadLoopTrampoline,
++                            this, PR_PRIORITY_NORMAL, PR_LOCAL_THREAD,
++                            PR_JOINABLE_THREAD, 0);
++#else
++  (void)aWidth;
++  (void)aHeight;
++#endif
++}
++
++void HeroCameraPipe::Stop() {
++#ifdef XP_WIN
++  mStop = true;
++  if (void* handle = mHandle.exchange(nullptr)) {
++    // Closing the handle is what wakes a reader blocked in ReadFile.
++    ::CloseHandle(reinterpret_cast<HANDLE>(handle));
++  }
++  if (mThread) {
++    if (mThread != PR_GetCurrentThread()) {
++      PR_JoinThread(mThread);
++    }
++    // On the reader itself the thread ends with this object; joining would wait forever.
++    mThread = nullptr;
++  }
++#endif
++}
++
++bool HeroCameraPipe::CopyLatest(nsTArray<uint8_t>& aOut, int32_t* aWidth,
++                                int32_t* aHeight) {
++  MutexAutoLock lock(mMutex);
++  if (!mHasFrame) {
++    return false;
++  }
++  aOut = mFrame;
++  *aWidth = mWidth;
++  *aHeight = mHeight;
++  return true;
++}
++
++#ifdef XP_WIN
++/*static*/ void HeroCameraPipe::ReadLoopTrampoline(void* aArg) {
++  RefPtr<HeroCameraPipe> self = do_AddRef(static_cast<HeroCameraPipe*>(aArg));
++  self->ReadLoop();
++}
++
++void HeroCameraPipe::ReadLoop() {
++  const uint32_t expectedWidth = mExpectedWidth;
++  const uint32_t expectedHeight = mExpectedHeight;
++
++  // The launcher can rebuild its pipe (profile relaunch, producer watchdog), so
++  // a closed handle is not the end of the camera: reconnect and keep the last
++  // frame until the new server has one.
++  while (!mStop) {
++    HANDLE handle = INVALID_HANDLE_VALUE;
++    for (int attempt = 0; attempt < kConnectAttempts && !mStop; ++attempt) {
++      handle = ::CreateFileW(reinterpret_cast<const wchar_t*>(mName.get()),
++                             GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
++                             nullptr, OPEN_EXISTING, 0, nullptr);
++      if (handle != INVALID_HANDLE_VALUE) {
++        break;
++      }
++      ::Sleep(50);
++    }
++    if (handle == INVALID_HANDLE_VALUE) {
++      return;
++    }
++    mHandle = reinterpret_cast<void*>(handle);
++
++    while (!mStop) {
++      uint8_t header[kHeaderLength];
++      if (!ReadExact(handle, header, sizeof(header))) {
++        break;
++      }
++      if (memcmp(header, "HFV1", 4) != 0) {
++        break;
++      }
++      const uint32_t width = LittleEndian32(header + 4);
++      const uint32_t height = LittleEndian32(header + 8);
++      // The producer frames the video to the size the camera advertises. A
++      // frame of another size would make the track lie about its settings.
++      if (width != expectedWidth || height != expectedHeight || width == 0 ||
++          height == 0 || width > kMaxWidth || height > kMaxHeight ||
++          (width & 1) || (height & 1)) {
++        break;
++      }
++      const size_t yLength = static_cast<size_t>(width) * height;
++      const size_t frameLength = yLength + yLength / 2;
++      nsTArray<uint8_t> frame;
++      if (!frame.SetLength(frameLength, fallible)) {
++        break;
++      }
++      if (!ReadExact(handle, frame.Elements(), frameLength)) {
++        break;
++      }
++      {
++        MutexAutoLock lock(mMutex);
++        mFrame = std::move(frame);
++        mWidth = static_cast<int32_t>(width);
++        mHeight = static_cast<int32_t>(height);
++        mHasFrame = true;
++      }
++    }
++
++    if (mHandle.exchange(nullptr) == reinterpret_cast<void*>(handle)) {
++      ::CloseHandle(handle);
++    }
++    if (mStop) {
++      return;
++    }
++    // Give the producer a moment to recreate the server; without it the
++    // reopen can land on the stale instance and fail again immediately.
++    for (int attempt = 0; attempt < 20 && !mStop; ++attempt) {
++      ::Sleep(50);
++    }
++  }
++}
++#endif
++
++}  // namespace mozilla
+diff --git a/dom/media/systemservices/HeroCameraPipe.h b/dom/media/systemservices/HeroCameraPipe.h
+new file mode 100644
+index 0000000..ee1dc63
+--- /dev/null
++++ b/dom/media/systemservices/HeroCameraPipe.h
+@@ -0,0 +1,68 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef DOM_MEDIA_SYSTEMSERVICES_HEROCAMERAPIPE_H_
++#define DOM_MEDIA_SYSTEMSERVICES_HEROCAMERAPIPE_H_
++
++#include "mozilla/Mutex.h"
++#include "mozilla/ThreadSafety.h"
++#include "nsISupportsImpl.h"
++#include "nsString.h"
++#include "nsTArray.h"
++
++#ifdef XP_WIN
++#  include <atomic>
++
++#  include "prthread.h"
++#endif
++
++namespace mozilla {
++
++/**
++ * The launcher's side of a virtual camera: a named pipe carrying I420 frames.
++ *
++ * The producer (Hero Browser) writes fixed 24-byte headers followed by one
++ * frame; this reader keeps the latest complete frame so the fake video source
++ * can publish it at the camera's frame rate. Only Windows has the producer, so
++ * other platforms compile the frame copy as a no-op.
++ */
++class HeroCameraPipe {
++ public:
++  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(HeroCameraPipe)
++
++  explicit HeroCameraPipe(const nsAString& aName);
++
++  /// Opens the pipe and starts reading. Frames that do not match the camera's
++  /// own size are dropped, so the track never receives a frame of another size.
++  void Start(uint32_t aWidth, uint32_t aHeight);
++  /// Closes the pipe and joins the reader. Safe to call more than once.
++  void Stop();
++
++  /// Copies the newest complete frame. False until the first one arrives.
++  bool CopyLatest(nsTArray<uint8_t>& aOut, int32_t* aWidth, int32_t* aHeight);
++
++ private:
++  ~HeroCameraPipe();
++
++#ifdef XP_WIN
++  static void ReadLoopTrampoline(void* aArg);
++  void ReadLoop();
++  const nsString mName;
++  std::atomic<bool> mStop{false};
++  std::atomic<void*> mHandle{nullptr};
++  PRThread* mThread = nullptr;
++  uint32_t mExpectedWidth = 0;
++  uint32_t mExpectedHeight = 0;
++#endif
++
++  Mutex mMutex{"HeroCameraPipe::mMutex"};
++  nsTArray<uint8_t> mFrame MOZ_GUARDED_BY(mMutex);
++  int32_t mWidth MOZ_GUARDED_BY(mMutex) = 0;
++  int32_t mHeight MOZ_GUARDED_BY(mMutex) = 0;
++  bool mHasFrame MOZ_GUARDED_BY(mMutex) = false;
++};
++
++}  // namespace mozilla
++
++#endif  // DOM_MEDIA_SYSTEMSERVICES_HEROCAMERAPIPE_H_
+diff --git a/dom/media/systemservices/moz.build b/dom/media/systemservices/moz.build
+index 1d65652..b7e8c60 100644
+--- a/dom/media/systemservices/moz.build
++++ b/dom/media/systemservices/moz.build
+@@ -110,6 +110,7 @@ UNIFIED_SOURCES += [
+ ]
+ SOURCES += [
+     "FakeVideoSource.cpp",
++    "HeroCameraPipe.cpp",
+ ]
+ IPDL_SOURCES += [
+     "PCameras.ipdl",
+diff --git a/dom/media/webrtc/MediaEngineFake.cpp b/dom/media/webrtc/MediaEngineFake.cpp
+index eefae5b..676c454 100644
+--- a/dom/media/webrtc/MediaEngineFake.cpp
++++ b/dom/media/webrtc/MediaEngineFake.cpp
+@@ -82,12 +82,32 @@ static nsString FakeVideoName() {
+   return u"Default Video Device"_ns;
+ }
+ 
++#ifdef XP_WIN
++// Hero Browser: the launcher decodes a video for each phone camera and serves
++// it on a named pipe. The config names the profile and which lenses have one;
++// no keys means the generated test pattern is used, as before.
++static nsString CameraPipeName(VideoFacingModeEnum aFacing) {
++  const bool front = aFacing == VideoFacingModeEnum::User;
++  const auto profile = MaskConfig::GetString("camera.profile");
++  if (!profile ||
++      !MaskConfig::GetBool(front ? "camera.front" : "camera.back")) {
++    return u""_ns;
++  }
++  nsString pipe(u"\\\\.\\pipe\\hero-camera-"_ns);
++  pipe.Append(NS_ConvertUTF8toUTF16(profile->c_str()));
++  pipe.Append(front ? u"-front"_ns : u"-back"_ns);
++  return pipe;
++}
++#endif
++
+ /**
+  * Fake video source.
+  */
+ class MediaEngineFakeVideoSource : public MediaEngineSource {
+  public:
+-  MediaEngineFakeVideoSource();
++  explicit MediaEngineFakeVideoSource(
++      VideoFacingModeEnum aFacing = VideoFacingModeEnum::Environment,
++      bool aIdentityDevice = false);
+ 
+   static already_AddRefed<MediaEngineFakeVideoSource> CreateFrom(
+       const MediaEngineFakeVideoSource* aSource);
+@@ -135,17 +155,25 @@ class MediaEngineFakeVideoSource : public MediaEngineSource {
+ 
+   MediaEnginePrefs mOpts;
+ 
++  // Camoufox: which phone lens this source is, and the launcher's pipe for it.
++  VideoFacingModeEnum mFacing = VideoFacingModeEnum::Environment;
++  bool mIdentityDevice = false;
++  nsString mPipeName;
++
+   // Main thread only.
+   const RefPtr<media::Refcountable<dom::MediaTrackSettings>> mSettings;
+ };
+ 
+-MediaEngineFakeVideoSource::MediaEngineFakeVideoSource()
+-    : mSettings(MakeAndAddRef<media::Refcountable<MediaTrackSettings>>()) {
++MediaEngineFakeVideoSource::MediaEngineFakeVideoSource(VideoFacingModeEnum aFacing,
++                                                       bool aIdentityDevice)
++    : mFacing(aFacing),
++      mIdentityDevice(aIdentityDevice),
++      mSettings(MakeAndAddRef<media::Refcountable<MediaTrackSettings>>()) {
+   mSettings->mWidth.Construct(int32_t(VIDEO_WIDTH_DEFAULT));
+   mSettings->mHeight.Construct(int32_t(VIDEO_HEIGHT_DEFAULT));
+   mSettings->mFrameRate.Construct(double(MediaEnginePrefs::DEFAULT_VIDEO_FPS));
+-  mSettings->mFacingMode.Construct(NS_ConvertASCIItoUTF16(
+-      dom::GetEnumString(VideoFacingModeEnum::Environment)));
++  mSettings->mFacingMode.Construct(
++      NS_ConvertASCIItoUTF16(dom::GetEnumString(aFacing)));
+   mSettings->mResizeMode.Construct(NS_ConvertASCIItoUTF16(
+       dom::GetEnumString(dom::VideoResizeModeEnum::None)));
+ }
+@@ -153,7 +181,8 @@ MediaEngineFakeVideoSource::MediaEngineFakeVideoSource()
+ /*static*/ already_AddRefed<MediaEngineFakeVideoSource>
+ MediaEngineFakeVideoSource::CreateFrom(
+     const MediaEngineFakeVideoSource* aSource) {
+-  auto src = MakeRefPtr<MediaEngineFakeVideoSource>();
++  auto src = MakeRefPtr<MediaEngineFakeVideoSource>(aSource->mFacing,
++                                                    aSource->mIdentityDevice);
+   *static_cast<MediaTrackSettings*>(src->mSettings) = *aSource->mSettings;
+   return src.forget();
+ }
+@@ -176,6 +205,10 @@ uint32_t MediaEngineFakeVideoSource::GetBestFitnessDistance(
+     const auto resizeMode = MediaConstraintsHelper::GetResizeMode(*cs, aPrefs);
+     using H = MediaConstraintsHelper;
+     Maybe<nsString> facingMode = Nothing();
++    if (mIdentityDevice) {
++      facingMode =
++          Some(NS_ConvertASCIItoUTF16(dom::GetEnumString(mFacing)));
++    }
+     distance += H::FitnessDistance(facingMode, cs->mFacingMode);
+ 
+     if (resizeMode.valueOr(dom::VideoResizeModeEnum::None) ==
+@@ -206,8 +239,7 @@ void MediaEngineFakeVideoSource::GetCapabilities(
+     MediaTrackCapabilities& aOutCapabilities) const {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+-  NS_ConvertASCIItoUTF16 facingString(
+-      GetEnumString(VideoFacingModeEnum::Environment));
++  NS_ConvertASCIItoUTF16 facingString(GetEnumString(mFacing));
+   nsTArray<nsString> facing;
+   facing.AppendElement(facingString);
+   aOutCapabilities.mFacingMode.Construct(std::move(facing));
+@@ -221,18 +253,35 @@ void MediaEngineFakeVideoSource::GetCapabilities(
+   }
+ 
+   dom::ULongRange widthRange;
+-  widthRange.mMax.Construct(VIDEO_WIDTH_MAX);
+-  widthRange.mMin.Construct(1);
++  // Camoufox: a virtual camera has the one size the launcher encodes, so a page
++  // cannot ask for another and then read a setting the frames do not have.
++  if (auto width = MaskConfig::GetUint32("camera.width")) {
++    widthRange.mMax.Construct(*width);
++    widthRange.mMin.Construct(*width);
++  } else {
++    widthRange.mMax.Construct(VIDEO_WIDTH_MAX);
++    widthRange.mMin.Construct(1);
++  }
+   aOutCapabilities.mWidth.Construct(widthRange);
+ 
+   dom::ULongRange heightRange;
+-  heightRange.mMax.Construct(VIDEO_HEIGHT_MAX);
+-  heightRange.mMin.Construct(1);
++  if (auto height = MaskConfig::GetUint32("camera.height")) {
++    heightRange.mMax.Construct(*height);
++    heightRange.mMin.Construct(*height);
++  } else {
++    heightRange.mMax.Construct(VIDEO_HEIGHT_MAX);
++    heightRange.mMin.Construct(1);
++  }
+   aOutCapabilities.mHeight.Construct(heightRange);
+ 
+   dom::DoubleRange frameRateRange;
+-  frameRateRange.mMax.Construct(double(MediaEnginePrefs::DEFAULT_VIDEO_FPS));
+-  frameRateRange.mMin.Construct(0);
++  if (auto fps = MaskConfig::GetUint32("camera.fps")) {
++    frameRateRange.mMax.Construct(double(*fps));
++    frameRateRange.mMin.Construct(double(*fps));
++  } else {
++    frameRateRange.mMax.Construct(double(MediaEnginePrefs::DEFAULT_VIDEO_FPS));
++    frameRateRange.mMin.Construct(0);
++  }
+   aOutCapabilities.mFrameRate.Construct(frameRateRange);
+ }
+ 
+@@ -248,18 +297,37 @@ nsresult MediaEngineFakeVideoSource::Allocate(
+   // emulator debug is very, very slow; reduce load on it with smaller/slower
+   // fake video
+   mOpts = aPrefs;
+-  mOpts.mWidth = aPrefs.mWidth ? aPrefs.mWidth : VIDEO_WIDTH_DEFAULT;
+-  mOpts.mHeight = aPrefs.mHeight ? aPrefs.mHeight : VIDEO_HEIGHT_DEFAULT;
+-
+-  const auto resizeMode = MediaConstraintsHelper::GetResizeMode(c, mOpts);
+-  const auto resizeModeString = resizeMode.map(
+-      [](auto aRM) { return NS_ConvertASCIItoUTF16(dom::GetEnumString(aRM)); });
+-  if (resizeMode.valueOr(VideoResizeModeEnum::None) ==
+-      VideoResizeModeEnum::Crop_and_scale) {
+-    mOpts.mWidth = c.mWidth.Get(mOpts.mWidth);
+-    mOpts.mHeight = c.mHeight.Get(mOpts.mHeight);
+-    mOpts.mFPS = std::min(mOpts.mFPS, SaturatingCast<int32_t>(c.mFrameRate.Get(
+-                                          AssertedCast<double>(mOpts.mFPS))));
++#ifdef XP_WIN
++  mPipeName = CameraPipeName(mFacing);
++  const bool pipe = !mPipeName.IsEmpty();
++#else
++  const bool pipe = false;
++#endif
++  Maybe<nsString> resizeModeString = Nothing();
++  if (pipe || mIdentityDevice) {
++    // The launcher produced these frames at exactly this size; honouring a
++    // page's request for another would make getSettings() disagree with them.
++    mOpts.mWidth = int32_t(
++        MaskConfig::GetUint32("camera.width").value_or(VIDEO_WIDTH_DEFAULT));
++    mOpts.mHeight = int32_t(
++        MaskConfig::GetUint32("camera.height").value_or(VIDEO_HEIGHT_DEFAULT));
++    mOpts.mFPS = int32_t(MaskConfig::GetUint32("camera.fps")
++                             .value_or(MediaEnginePrefs::DEFAULT_VIDEO_FPS));
++  } else {
++    mOpts.mWidth = aPrefs.mWidth ? aPrefs.mWidth : VIDEO_WIDTH_DEFAULT;
++    mOpts.mHeight = aPrefs.mHeight ? aPrefs.mHeight : VIDEO_HEIGHT_DEFAULT;
++
++    const auto resizeMode = MediaConstraintsHelper::GetResizeMode(c, mOpts);
++    resizeModeString = resizeMode.map([](auto aRM) {
++      return NS_ConvertASCIItoUTF16(dom::GetEnumString(aRM));
++    });
++    if (resizeMode.valueOr(VideoResizeModeEnum::None) ==
++        VideoResizeModeEnum::Crop_and_scale) {
++      mOpts.mWidth = c.mWidth.Get(mOpts.mWidth);
++      mOpts.mHeight = c.mHeight.Get(mOpts.mHeight);
++      mOpts.mFPS = std::min(mOpts.mFPS, SaturatingCast<int32_t>(c.mFrameRate.Get(
++                                            AssertedCast<double>(mOpts.mFPS))));
++    }
+   }
+ 
+   mOpts.mWidth = std::clamp(mOpts.mWidth, 1, VIDEO_WIDTH_MAX);
+@@ -268,6 +336,11 @@ nsresult MediaEngineFakeVideoSource::Allocate(
+ 
+   nsCOMPtr<nsISerialEventTarget> target = GetCurrentSerialEventTarget();
+   mCapturer = MakeRefPtr<FakeVideoSource>(target);
++#ifdef XP_WIN
++  if (pipe) {
++    mCapturer->SetCameraPipe(mPipeName);
++  }
++#endif
+   mGeneratedImageListener = mCapturer->GeneratedImageEvent().Connect(
+       target, this, &MediaEngineFakeVideoSource::OnGeneratedImage);
+ 
+@@ -692,8 +765,16 @@ RefPtr<MediaEngineSource> MediaEngineFake::CreateSource(
+     const MediaDevice* aMediaDevice) {
+   MOZ_ASSERT(aMediaDevice->mEngine == this);
+   switch (aMediaDevice->mMediaSource) {
+-    case MediaSourceEnum::Camera:
+-      return MakeRefPtr<MediaEngineFakeVideoSource>();
++    case MediaSourceEnum::Camera: {
++      const bool identity = ServesIdentityDevices();
++      // The identity's two webcams are enumerated as camou-0 (back) and
++      // camou-1 (front), in that order.
++      const VideoFacingModeEnum facing =
++          identity && aMediaDevice->mRawID.EqualsLiteral("camou-1")
++              ? VideoFacingModeEnum::User
++              : VideoFacingModeEnum::Environment;
++      return MakeRefPtr<MediaEngineFakeVideoSource>(facing, identity);
++    }
+     case MediaSourceEnum::Microphone:
+       return MakeRefPtr<MediaEngineFakeAudioSource>();
+     default:
