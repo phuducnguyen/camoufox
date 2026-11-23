@@ -395,8 +395,7 @@ index 0000000..464b0cc
 +  while (!mStop) {
 +    HANDLE handle = INVALID_HANDLE_VALUE;
 +    for (int attempt = 0; attempt < kConnectAttempts && !mStop; ++attempt) {
-+      handle = ::CreateFileW(
-          reinterpret_cast<const wchar_t*>(static_cast<const char16_t*>(mName.get())),
++      handle = ::CreateFileW(reinterpret_cast<const wchar_t*>(static_cast<const char16_t*>(mName.get())),
 +                             GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
 +                             nullptr, OPEN_EXISTING, 0, nullptr);
 +      if (handle != INVALID_HANDLE_VALUE) {
