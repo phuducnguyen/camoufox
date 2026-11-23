@@ -398,13 +398,6 @@ inline bool GetBool(std::string_view key) {
 // platform is configured; Other, one no identity uses.
 enum class SpoofedOS { None, Windows, MacOS, Linux, Android, Other };
 
-inline SpoofedOS SpoofedOSFor(std::string_view platform) {
-  if (platform == "Win32") return SpoofedOS::Windows;
-  if (platform == "MacIntel") return SpoofedOS::MacOS;
-  // Android presents a Linux platform; classify it before the generic Linux
-  // branch so system fonts and WebRTC ports use Android's values, not Ubuntu's.
-  if (platform.rfind("Linux armv8", 0) == 0) return SpoofedOS::Android;
-  if (platform.rfind("Linux", 0) == 0) return SpoofedOS::Linux;
 // Narrow or UTF-16: a context's navigator.platform is stored as UTF-16, and
 // the getters that ask for its OS are page-callable, so it is matched without
 // a conversion.
@@ -422,6 +415,9 @@ inline SpoofedOS SpoofedOSForImpl(std::basic_string_view<CharT> platform) {
   };
   if (equals("Win32")) return SpoofedOS::Windows;
   if (equals("MacIntel")) return SpoofedOS::MacOS;
+  // Android presents a Linux platform; classify it before the generic Linux
+  // branch so system fonts and WebRTC ports use Android's values, not Ubuntu's.
+  if (startsWith("Linux armv8")) return SpoofedOS::Android;
   if (startsWith("Linux")) return SpoofedOS::Linux;
   return SpoofedOS::Other;
 }
