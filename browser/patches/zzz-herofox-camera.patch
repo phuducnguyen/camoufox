@@ -756,10 +756,10 @@ index eefae5b..676c454 100644
 -      return MakeRefPtr<MediaEngineFakeVideoSource>();
 +    case MediaSourceEnum::Camera: {
 +      const bool identity = ServesIdentityDevices();
-+      // The identity's two webcams are enumerated as camou-0 (back) and
-+      // camou-1 (front), in that order.
++      // The identity's two webcams are enumerated as camou-cam-0 (back) and
++      // camou-cam-1 (front), in that order.
 +      const VideoFacingModeEnum facing =
-+          identity && aMediaDevice->mRawID.EqualsLiteral("camou-1")
++          identity && aMediaDevice->mRawID.EqualsLiteral("camou-cam-1")
 +              ? VideoFacingModeEnum::User
 +              : VideoFacingModeEnum::Environment;
 +      return MakeRefPtr<MediaEngineFakeVideoSource>(facing, identity);
