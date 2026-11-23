@@ -26,12 +26,15 @@ camoufox fetch
 
 | Requirement | Value |
 |---|---|
-| Python | 3.10 or newer |
+| Python | 3.11 or newer |
 | Playwright | below 1.63 (installed as a dependency) |
 | `geoip` extra | needed for `geoip=`; downloads the [GeoIP All-in-One](https://github.com/daijro/geoip-all-in-one) database, refreshed once it is a week old |
 
 `camoufox fetch` installs the browser build this release is paired with, and
 fpgen's model, pinned by sha256. Without it, the first launch downloads both.
+It reads the build's release with one GitHub API call and exits non-zero
+when it installs nothing. On a shared CI runner, set `GITHUB_TOKEN` to raise
+GitHub's API rate limit.
 Run `fetch` as the user that owns the Python environment if the browser will
 run as someone else, for example while building a Docker image.
 `camoufox remove` deletes everything that was downloaded.
@@ -100,7 +103,7 @@ not a `Browser`.
 ### One browser, many identities
 
 `NewContext()` gives each context its own identity (navigator, screen, WebGL,
-fonts, voices, audio seed, timezone, WebRTC IP), applied through
+fonts, voices, timezone, WebRTC IP), applied through
 `add_init_script` before any page script runs.
 
 ```python
@@ -123,7 +126,7 @@ with Camoufox(headless=True, canvas_noise=True) as browser:
 | `os` | `"windows"`, `"macos"` or `"linux"` for the drawn identity. On a browser without canvas noise, the host's OS, and anything else raises `ValueError`. |
 | `ff_version` | Firefox major version claimed in the User-Agent. Defaults to the browser's own. |
 | `webrtc_ip` | IPv4 or IPv6 address WebRTC reports. |
-| `proxy` | Per-context proxy, in Playwright's format. Unless `webrtc_ip` and `timezone_id` are both given, they are looked up from the proxy's exit IP, and `InvalidIP` is raised if the lookup fails. |
+| `proxy` | Per-context proxy, in Playwright's format. The context is placed where the proxy exits: `webrtc_ip`, `timezone_id`, `locale` and `geolocation` each default to the exit IP's, looked up through the proxy unless all four are given, and `InvalidIP` is raised if the lookup fails. |
 | `geolocation` | `{"latitude": ..., "longitude": ...}`; also grants the `geolocation` permission. |
 | anything else | Passed to Playwright's `new_context()`, overriding the generated value. |
 
@@ -134,6 +137,16 @@ Canvas noise belongs to the browser, not the context (see
 every context claims the host's OS and GPU too, since its canvas renders there.
 Contexts with other OSes, like the ones above, need `canvas_noise=True`.
 
+The browser's own OS also decides some things for all its contexts. A browser
+launched as Windows on a Linux or macOS host (`os="windows"`, or drawn so)
+computes `Math` as the Windows CRT does and uses Windows' keyboard shortcuts
+(on a Linux host; on macOS only the editor caret style), middle-click and
+scrollbars ([docs/HOST-PARITY.md](../docs/HOST-PARITY.md)).
+Those are browser settings, so a macOS context on it has them too, and a
+Windows context on a browser launched as another OS has the host's. `NewContext`
+does not refuse the mix. Pass `os` at launch for the OS whose behaviour matters,
+or use one browser per OS.
+
 ### The canvas on another OS
 
 A page can draw a canvas or a WebGL scene and read the pixels back. Those pixels
@@ -142,8 +155,10 @@ come from the real OS, driver and GPU, whatever the identity claims.
 - **On the host's OS**, the launcher starts the browser once, unspoofed and with
   the same display, reads the GPU Firefox reports, and the identity claims it.
   The pixels then agree with the identity. A host that renders in software (no
-  GPU driver, as on most servers) keeps a drawn GPU: it reads as a machine
-  whose driver failed to load.
+  working GPU driver, as on most servers) claims its software renderer, such as
+  `llvmpipe` on Linux. Firefox reads the name and the pixels from one GL context,
+  so a machine with a broken driver reports the software renderer too, and a GPU
+  name over software pixels never happens on a real machine.
 - **On another OS, or with another GPU** (`webgl_config`, a preset's GPU, or a
   host GPU fpgen never recorded), the pixels would show the real one. Camoufox
   then turns on the canvas protection of `privacy.resistFingerprinting`, and
@@ -268,11 +283,11 @@ passed to Playwright's `firefox.launch()` (or `launch_persistent_context()`).
 | `headless` | `bool`, `"virtual"` or `"virtual-gpu"` | `False` | See [Headless modes](#headless-modes). |
 | `gpu` | `str` or `int` | `CAMOUFOX_GPU`, or the only GPU | The card for `headless="virtual-gpu"`. See [The GPU display](#the-gpu-display). Not taken by `launch_options`. |
 | `require_gpu` | `bool` | `True` | With `headless="virtual-gpu"`, fail the launch when the browser does not render on the card; `False` warns. Not taken by `launch_options`. |
-| `proxy` | `dict` | none | Playwright proxy: `server`, `username`, `password`, `bypass`. |
+| `proxy` | `dict` | none | Playwright proxy: `server`, `username`, `password`, `bypass`. A `socks5://` proxy can have a username and password too (RFC 1929), which Playwright alone refuses; the same holds for `NewContext()` and `new_context()`. |
 | `geoip` | `bool` or `str` | none | `True` finds the public IP (through `proxy` if set); a string uses that IP. Sets timezone, locale, geolocation and the WebRTC IP. Without a proxy, also decides whether IPv6 stays on. Needs the `geoip` extra. |
 | `geoip_db` | `str` | the `camoufox set --geoip` choice | GeoIP database name, e.g. `"GeoIP AIO by daijro"`. |
 | `locale` | `str` or `list[str]` | from `geoip`, else the drawn identity's | Locale(s), e.g. `"en-US"` or `["fr-FR", "en-US"]`. The first is used for `Intl`. |
-| `humanize` | `bool` or `float` | off | Human cursor movement. A number caps one movement at that many seconds (default cap 1.5). |
+| `humanize` | `bool \| dict` | off | Driver-side human input. The browser has none of its own: each Playwright input call is one event. `True` runs `myuri()` on every channel. A dict picks `myuri()`, `myuri(part=fn)` or `raw()` from `camoufox.humanize` per channel (`mouse`, `keyboard`, `scroll`; an omitted one is `myuri()`), plus an integer `seed` in [0, 2\*\*32) for its stream and myuri's `settings` (speeds, mistakes, pauses; [Human input](../README.md#human-input)). |
 | `screen` | `camoufox.fingerprints.Screen` | the real display when headed | Bounds the generated screen: `Screen(max_width=1920, max_height=1080)`. |
 | `window` | `(int, int)` | generated | Fixed outer window size. |
 | `fonts` | `list[str]` | none | Extra font families on top of the OS's own. |
@@ -283,6 +298,7 @@ passed to Playwright's `firefox.launch()` (or `launch_persistent_context()`).
 | `block_webrtc` | `bool` | `False` | Disable WebRTC entirely. |
 | `block_webgl` | `bool` | `False` | Disable WebGL. Warns: many WAFs check for it. |
 | `webgl_config` | `(vendor, renderer)` | drawn | Use one GPU fpgen has recorded for Firefox on `os` (see `camoufox.webgl.firefox_gpus`); any other pair raises `ValueError`. Needs `os`. |
+| `cpu` | `{'arch': 'x86' or 'arm', 'manufacturer': str}` | follows the GPU and cores, else x86 drawn | The CPU the identity computes as: canvas, Web Audio, Opus, relaxed-SIMD wasm and NaN signs differ between x86-64 and ARM64, and canvas and Opus between Intel and AMD. A manufacturer alone implies its arch. Per OS: macos x86 `intel`, arm `apple`; windows x86 `intel`/`amd`, arm `qualcomm`; linux x86 `intel`/`amd`, arm `apple`, `qualcomm`, `broadcom`, `nvidia`, `ampere`, `rockchip`, `mediatek`, `amlogic`, `allwinner`. A pair no machine on the OS has, or one the GPU contradicts, raises `ValueError`; without `os`, the OS is drawn among those with a recorded GPU for the CPU. By default an Apple GPU is Apple ARM, an Intel iGPU or Intel Mac Intel, a Radeon iGPU AMD, and 10, 14, 18, 22 or 28 logical cores Intel; otherwise x86, 81% Intel. ARM64 is emulated on an x86-64 host, and Intel or AMD x86-64 on an ARM64 host. |
 | `canvas_noise` | `bool` | on for another OS or GPU | Random canvas and WebGL readback, as in LibreWolf. Warns. See [The canvas on another OS](#the-canvas-on-another-os). |
 | `disable_coop` | `bool` | `False` | Turn off Cross-Origin-Opener-Policy so elements in cross-origin iframes (such as the Turnstile checkbox) can be clicked. Warns. |
 | `main_world_eval` | `bool` | `False` | Allow `page.evaluate("mw:...")` and `mw:` init scripts to run in the page's own world. |
@@ -292,7 +308,7 @@ passed to Playwright's `firefox.launch()` (or `launch_persistent_context()`).
 | `fingerprint` | fpgen fingerprint `dict` | drawn | Use this fpgen fingerprint instead of drawing one. Warns. |
 | `fingerprint_preset` | `bool` or `dict` | `None` | Opt into a recorded real-device preset instead of fpgen: `True` picks a random bundled one, a dict uses that one. |
 | `ff_version` | `int` | the browser's own | Firefox version to claim. Warns: a mismatch with the engine is detectable. |
-| `config` | `dict` | none | Raw Camoufox properties ([`properties.json`](https://github.com/daijro/camoufox/blob/main/browser/settings/properties.json)). Overrides the generated identity; manual identity keys warn. |
+| `config` | `dict` | none | Raw Camoufox properties ([`properties.json`](https://github.com/daijro/camoufox/blob/main/browser/settings/properties.json)). Overrides the generated identity; manual identity keys warn. A value you set is always used; one no real machine with the rest of the identity reports prints a `LeakWarning` naming it, which `i_know_what_im_doing` does not silence. |
 | `firefox_user_prefs` | `dict` | none | Extra Firefox prefs. |
 | `args` | `list[str]` | none | Extra browser command-line arguments. |
 | `env` | `dict` | a copy of the environment | Environment variables for the browser. |
@@ -311,7 +327,7 @@ passed to Playwright's `firefox.launch()` (or `launch_persistent_context()`).
 
 | Command | Options | What it does |
 |---|---|---|
-| `fetch [VERSION]` | | Install the paired build (or, after `set`, the latest in the chosen channel), or `VERSION` without making it active. Syncs first. |
+| `fetch [VERSION]` | | Install the paired build (or, after `set`, the latest in the chosen channel), or `VERSION` without making it active. A named or paired build is read from its own release; anything else syncs first. Exits non-zero when nothing is installed. |
 | `sync` | `--spoof-os auto\|mac\|win\|lin`, `--spoof-arch auto\|x86_64\|i686\|arm64` | Refresh the list of available builds from every repository. |
 | `set [SPECIFIER]` | `--geoip`, `--release` | Pin a build (`official/stable/134.0.2-beta.20`) or follow a channel (`official/stable`). No specifier opens a picker. `--geoip` picks the GeoIP database instead; `--release` goes back to the paired build. |
 | `active` | | Print the active build. A build that is chosen but not downloaded is marked `(not fetched)`. |

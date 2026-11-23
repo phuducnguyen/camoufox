@@ -28,7 +28,7 @@ CONFIG_PATH = CI_DIR / "build-tester.yml"
 # contexts all reporting "MacIntel" is correct, not a collision.
 #
 # Values Camoufox derives per context, where one collision is the leak itself.
-_MUST_VARY = ("uniqueAudio", "uniqueTimezones")
+_MUST_VARY = ("uniqueTimezones",)
 
 # Values that follow the device rather than the context. fonts, screens, voices
 # and WebGL are drawn from a pool of real devices, and three draws from a pool
@@ -37,11 +37,13 @@ _MUST_VARY = ("uniqueAudio", "uniqueTimezones")
 # follows the fonts and GPU the same way. Counted and reported, never fatal.
 _MAY_COLLIDE = ("uniqueCanvas", "uniqueFonts", "uniqueScreens", "uniqueVoices", "uniqueWebGL")
 
-# Properties of the operating system. Every macOS context reports MacIntel and
-# every Linux one reports Linux x86_64, because that is what those systems
-# report. Here a collision is the correct outcome and *variation* would be the
-# bug, so it is asserted in the opposite direction.
-_MUST_MATCH = ("uniquePlatforms",)
+# Properties of the operating system and the host. Every macOS context reports
+# MacIntel and every Linux one reports Linux x86_64, because that is what those
+# systems report; the audio render is the host CPU's, one value per
+# architecture as on stock (ci/tribal-rules.yml: audio-is-not-noised). Here a
+# collision is the correct outcome and *variation* would be the bug, so it is
+# asserted in the opposite direction.
+_MUST_MATCH = ("uniquePlatforms", "uniqueAudio")
 
 
 # A renderer string that names a software rasteriser. The page-side
@@ -85,9 +87,9 @@ def flatten(full: dict) -> Dict[str, str]:
     tests: Dict[str, str] = {}
     for profile in full.get("profiles") or []:
         meta = profile.get("profile") or {}
-        # Identify by os+mode+index, never by the display name, which carries a
-        # random letter suffix and would churn every run.
-        slot = f"{meta.get('os', '?')}-{meta.get('mode', '?')}-{meta.get('index', profile.get('index', 0))}"
+        # runner.py's display name ("macOS Per-Context A") is the one field that
+        # tells a run's profiles apart, and it is the same every run.
+        slot = meta["name"]
         results = profile.get("results") or {}
         if profile.get("error"):
             tests[f"{slot}/launch"] = evidence.ERROR
@@ -251,6 +253,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         violations.append(f"categories that must be clean have failing checks: {pretty}")
         status = evidence.FAIL
 
+    profiles = full.get("profiles") or []
+    errored = [p["profile"]["name"] for p in profiles if p.get("error")]
+    launched = len(profiles) - len(errored)
+    expected = int(cfg.get("profile_count", 8))
+    if errored or launched < expected:
+        reason = (
+            f"{launched} of {expected} profiles produced results"
+            + (f"; failed to launch: {', '.join(errored)}" if errored else "")
+        )
+        result.note(reason)
+        violations.append(reason)
+        status = evidence.FAIL
+    # runner.py exits 1 exactly when its raw totals differ, which includes
+    # checks this gate does not grade; any other exit code is unexplained.
+    explained = 0 if full.get("totalPassed") == full.get("totalChecks") else 1
+    if proc.code != explained:
+        reason = (
+            f"build-tester exited {proc.code}, but its totals "
+            f"({full.get('totalPassed')}/{full.get('totalChecks')}) account for {explained}"
+        )
+        result.note(reason)
+        violations.append(reason)
+        status = evidence.FAIL
+
     slots = uniqueness(full)
     allowed = int(cfg.get("allow_uniqueness_collisions", 0))
     result.metrics["uniqueness"] = slots
@@ -279,9 +305,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             status = evidence.FAIL
 
     if slots["not_constant"]:
-        result.note("OS-constant value varied between contexts: " + ", ".join(slots["not_constant"]))
+        result.note("OS- or host-constant value varied between contexts: " + ", ".join(slots["not_constant"]))
         violations.append(
-            "a value that is a property of the operating system differed between contexts of "
+            "a value that is a property of the operating system or the host differed between contexts of "
             "the same OS: " + ", ".join(slots["not_constant"])
         )
         status = evidence.FAIL

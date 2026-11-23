@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -367,7 +368,7 @@ def _dependency_files():
     for pattern in ("**/requirements*.txt", "**/pyproject.toml", "**/setup.cfg"):
         for path in REPO_ROOT.glob(pattern):
             parts = set(path.parts)
-            if "node_modules" in parts or ".venv" in parts or "venv" in parts:
+            if "node_modules" in parts or ".venv" in parts or "venv" in parts or ".claude" in parts:
                 continue
             # Skip the generated Firefox tree and any fetched upstream checkout.
             if any(p.startswith("camoufox-1") or p.startswith("playwright-python-") for p in path.parts):
@@ -626,6 +627,31 @@ def test_per_frame_state_reset_on_navigation_is_also_released_on_dispose():
     )
 
 
+def test_network_patch_reads_the_spoofed_user_agent_once():
+    patch = (BROWSER / "patches" / "network-patches.patch").read_text(encoding="utf-8")
+    assert "static const nsCString* MaskedUserAgent()" in patch
+    assert "mUserAgent.Assign(nsCString(value.value().c_str()));" not in patch, (
+        "UserAgent() runs off the main thread; it must not rewrite the shared mUserAgent per call."
+    )
+
+
+def test_juggler_reads_current_websocket_event_signatures():
+    source = (BROWSER / "additions" / "juggler" / "content" / "FrameTree.js").read_text(
+        encoding="utf-8"
+    )
+    expected = {
+        "webSocketClosed": "webSocketSerialID, httpChannelId, wasClean, code, reason",
+        "frameReceived": "webSocketSerialID, httpChannelId, frame",
+        "frameSent": "webSocketSerialID, httpChannelId, frame",
+    }
+    for callback, arguments in expected.items():
+        match = re.search(rf"\b{callback}:\s*\(([^)]*)\)\s*=>", source)
+        assert match, f"{callback} listener is missing from FrameTree.js"
+        assert match.group(1) == arguments, (
+            f"{callback} must read Firefox's current argument order; got ({match.group(1)})"
+        )
+
+
 def test_a_sandbox_held_over_a_page_window_is_nuked_not_just_dropped():
     """Dropping the reference leaves the compartment to the cycle collector.
 
@@ -676,6 +702,35 @@ def test_no_glyph_spacing_seed_anywhere():
             f"{source.relative_to(REPO_ROOT)} still carries the spacing seed"
             + explain("no-glyph-spacing-noise")
         )
+
+
+def test_no_audio_noise_anywhere():
+    """No live config key, no patch hooking the render, no setter, no seed sent,
+    and a guard holding the build to stock's recorded values."""
+    rule_id = "audio-is-not-noised"
+    assert "audio:seed" not in _live_properties(), explain(rule_id)
+    patches = BROWSER / "patches"
+    assert not (patches / "audio-fingerprint-manager.patch").exists(), explain(rule_id)
+    for source in sorted(patches.rglob("*.patch")):
+        text = source.read_text(encoding="utf-8", errors="ignore")
+        for marker in ("AudioFingerprintManager", "SetAudioFingerprintSeed", "audio:seed"):
+            assert marker not in text, (
+                f"{source.relative_to(REPO_ROOT)} still carries {marker}" + explain(rule_id)
+            )
+    for launcher in ("python/src/camoufox/fingerprints.py", "typescript/src/fingerprints.ts",
+                     "python/src/camoufox/utils.py", "typescript/src/utils.ts"):
+        text = (REPO_ROOT / launcher).read_text(encoding="utf-8")
+        assert "setAudioFingerprintSeed" not in text, (
+            f"{launcher} still calls setAudioFingerprintSeed" + explain(rule_id)
+        )
+        assert not re.search(r"""config\[["']audio:seed["']\]\s*=""", text), (
+            f"{launcher} still generates audio:seed" + explain(rule_id)
+        )
+    guard = BROWSER / "tests" / "playwright" / "patches" / "audio-matches-stock.py"
+    assert guard.exists(), explain(rule_id)
+    assert '"audio-matches-stock"' in (REPO_ROOT / "ci" / "run_patch_guards.py").read_text(), (
+        "the audio-matches-stock guard is not registered" + explain(rule_id)
+    )
 
 
 def test_no_canvas_seed_is_declared_or_sent():
@@ -760,14 +815,19 @@ def test_webgl_browser_owned_values_follow_firefox():
     from camoufox import webgl
 
     why = explain("webgl-browser-owned-values-follow-firefox")
-    recorded = {"params": {"33902": {"value": [1, 2048]}}, "shaderPrecisionFormats": [], "supportedExtensions": []}
-    webgl2 = {**recorded, "params": {"33902": {"value": [1, 1]}}}
+    # Line width (33902) and point size (33901) ranges: WebGL1 takes WebGL2's
+    # value for every parameter both report (one GL profile since Firefox 156).
+    recorded = {"params": {"33902": {"value": [1, 2048]}, "33901": {"value": [1, 2047]}},
+                "shaderPrecisionFormats": [], "supportedExtensions": []}
+    webgl2 = {**recorded, "params": {"33902": {"value": [1, 1]}, "33901": {"value": [1, 255]}}}
     for target_os in ("win", "mac", "lin"):
         config = webgl.to_config({"vendor": "v", "renderer": "r", **recorded}, webgl2, target_os)
         assert config["webGl:parameters"]["33902"] == [1, 1], why
+        assert config["webGl:parameters"]["33901"] == [1, 255], why
         assert ("EXT_depth_clamp" in config["webGl:supportedExtensions"]) == (target_os == "win"), why
     ts = (REPO_ROOT / "typescript" / "src" / "webgl.ts").read_text(encoding="utf-8")
-    for line in ('win: ["EXT_depth_clamp"]', 'ALIASED_LINE_WIDTH_RANGE = "33902"'):
+    for line in ('win: ["EXT_depth_clamp"]',
+                 'for (const [key, value] of Object.entries(config["webGl2:parameters"]))'):
         assert line in ts, why
 
     assert (BROWSER / "tests" / "playwright" / "patches" / "stock-gpu-parity.py").exists(), why
@@ -872,6 +932,66 @@ def test_pages_see_an_official_firefox_build():
 
 
 # ---------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------
+
+
+def test_every_build_is_optimized_like_stock():
+    """Rule: builds-are-optimized-like-stock."""
+    base = (BROWSER / "assets" / "base.mozconfig").read_text(encoding="utf-8").splitlines()
+    for option in (
+        "  x86_64-pc-linux-gnu|x86_64-pc-windows-msvc) ac_add_options --enable-lto=cross,full ;;",
+        "  *) ac_add_options --enable-lto=cross ;;",
+        "ac_add_options --enable-profile-use=cross",
+        'ac_add_options --with-pgo-profile-path="$CAMOUFOX_PGO_PROFILE/merged.profdata"',
+        'ac_add_options --with-pgo-jarlog="$CAMOUFOX_PGO_PROFILE/en-US.log"',
+        "ac_add_options --enable-rust-simd",
+    ):
+        assert option in base, explain("builds-are-optimized-like-stock")
+    # Only base.mozconfig decides it, so no target or workflow builds differently.
+    others = [*(BROWSER / "assets").glob("*.mozconfig"), *(REPO_ROOT / ".github" / "workflows").glob("*.yml")]
+    for path in others:
+        if path.name != "base.mozconfig":
+            text = path.read_text(encoding="utf-8")
+            for marker in ("-lto", "MOZ_LTO", "profile-use", "profile-generate", "MOZ_PGO"):
+                assert marker not in text, f"{path.name}" + explain("builds-are-optimized-like-stock")
+
+
+def test_patches_never_edit_additions():
+    """Rule: patches-never-edit-additions."""
+    additions = BROWSER / "additions"
+    provided = {str(f.relative_to(additions)) for f in additions.rglob("*") if f.is_file()}
+    edited = [
+        f"{patch.relative_to(BROWSER)}: {target}"
+        for patch in sorted((BROWSER / "patches").rglob("*.patch"))
+        for target in re.findall(r"^\+\+\+ b/(\S+)", patch.read_text(encoding="utf-8", errors="replace"), re.M)
+        if target in provided
+    ]
+    assert not edited, "\n".join(edited) + explain("patches-never-edit-additions")
+
+
+def test_one_build_entry_point():
+    """Rule: one-build-entry-point."""
+    builds = {
+        ("tests.yml", "build"): "python3 -m ci.run_build",
+        ("tests.yml", "preflight"): "python3 -m ci.run_build --target ${{ matrix.target }} --arch ${{ matrix.arch }} --preflight",
+        ("release.yml", "build-browser"): "python3 -m ci.run_build --target ${{ matrix.target }} --arch ${{ matrix.arch }}",
+    }
+    import yaml
+
+    for (workflow, job), command in builds.items():
+        steps = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8"))["jobs"][job]["steps"]
+        lines = [line.strip() for step in steps for line in (step.get("run") or "").splitlines()
+                 if not line.lstrip().startswith("#")]
+        assert command in lines, f"{workflow}:{job} does not run `{command}`" + explain("one-build-entry-point")
+        for direct in ("multibuild.py", "make build", "make -C browser build", "mach build", "make set-target"):
+            assert not any(direct in line for line in lines), (
+                f"{workflow}:{job} runs `{direct}` itself" + explain("one-build-entry-point"))
+    assert '"multibuild.py", "--target", args.target, "--arch", args.arch' in (
+        REPO_ROOT / "ci" / "run_build.py").read_text(encoding="utf-8"), explain("one-build-entry-point")
+
+
+# ---------------------------------------------------------------------------
 # juggler
 # ---------------------------------------------------------------------------
 
@@ -885,3 +1005,22 @@ def test_juggler_is_not_a_chrome_package():
         if f.is_file() and "chrome://juggler" in f.read_text(encoding="utf-8", errors="replace")
     ]
     assert not referencing, f"{referencing}\n" + explain("juggler-is-not-a-chrome-package")
+
+
+# ---------------------------------------------------------------------------
+# humanize
+# ---------------------------------------------------------------------------
+
+
+def test_the_launchers_take_the_smart_actions_page_reads_from_myuri():
+    """Rule: humanize-smart-actions-are-myuris."""
+    launchers = {
+        "python": (REPO_ROOT / "python" / "src" / "camoufox", "*.py", "from myuri.page_functions import HIT_TEST_JS"),
+        "typescript": (REPO_ROOT / "typescript" / "src", "*.ts", "HIT_TEST_JS"),
+    }
+    for name, (root, pattern, import_line) in launchers.items():
+        sources = {f.relative_to(REPO_ROOT): f.read_text(encoding="utf-8") for f in root.rglob(pattern)}
+        own = [str(f) for f, text in sources.items() if "elementFromPoint" in text or "elementsFromPoint" in text]
+        assert not own, f"{name} hit-tests the page itself in {own}" + explain("humanize-smart-actions-are-myuris")
+        assert any(import_line in text and "myuri" in text for text in sources.values()), (
+            f"{name} does not take HIT_TEST_JS from myuri" + explain("humanize-smart-actions-are-myuris"))

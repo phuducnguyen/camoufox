@@ -53,6 +53,46 @@ it("keeps an explicit deprecated source", () => {
 	expect(g.loadGeoipConfig().name).toBe(DEPRECATED);
 });
 
+it("moves an implicit source missing from repos.yml to the default", () => {
+	saved({ name: "Gone" });
+	const config = g.loadGeoipConfig();
+	expect(config.name).toBe(DEFAULT);
+	expect(config).toHaveProperty("urls");
+	expect(config).toHaveProperty("paths");
+});
+
+it("raises, naming it, for an explicit source missing from repos.yml", () => {
+	saved({ name: "Gone", explicit: true });
+	expect(() => g.loadGeoipConfig()).toThrow(
+		/'Gone' not found. Available: \[.*GeoIP AIO by daijro/,
+	);
+});
+
+it("the CLI reports an explicit source missing from repos.yml", async () => {
+	saved({ name: "Gone", explicit: true });
+	const savedArgv = process.argv;
+	let output = "";
+	const write = vi
+		.spyOn(process.stdout, "write")
+		.mockImplementation((chunk) => {
+			output += String(chunk);
+			return true;
+		});
+	try {
+		for (const command of ["version", "list"]) {
+			vi.resetModules();
+			process.argv = ["node", "camoufox", command];
+			await import("../src/__main__.js");
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		}
+	} finally {
+		write.mockRestore();
+		process.argv = savedArgv;
+	}
+	expect(process.exitCode ?? 0).toBe(0);
+	expect(output.match(/'Gone' not found/g)).toHaveLength(2);
+});
+
 it("records an explicit choice", () => {
 	const config = g.getGeoipConfigByName(DEPRECATED);
 	g.saveGeoipConfig(config, true);
@@ -134,4 +174,28 @@ it.each([
 
 it("needs an update when the database is missing", async () => {
 	expect(await g.needsUpdate()).toBe(true);
+});
+
+it("opens a database with the installed maxmind", async () => {
+	// Every other test fakes openDatabase, so this is the one that constructs
+	// maxmind's Reader as imported. The database is empty: the data section
+	// separator, then the metadata marker and the three fields Reader needs.
+	const str = (s: string) => Buffer.from([0x40 | s.length, ...Buffer.from(s)]);
+	const mmdb = path.join(tmp, "empty.mmdb");
+	fs.writeFileSync(
+		mmdb,
+		Buffer.concat([
+			Buffer.alloc(16),
+			Buffer.from("abcdef4d61784d696e642e636f6d", "hex"),
+			Buffer.from([0xe3]),
+			str("record_size"),
+			Buffer.from([0xa1, 24]),
+			str("ip_version"),
+			Buffer.from([0xa1, 4]),
+			str("node_count"),
+			Buffer.from([0xc0]),
+		]),
+	);
+	const reader = await g.geoipDeps.openDatabase(mmdb);
+	expect(reader.get("1.2.3.4")).toBeNull();
 });

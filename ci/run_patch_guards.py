@@ -38,55 +38,109 @@ GUARD_DIR = REPO_ROOT / "browser" / "tests" / "playwright" / "patches"
 GROUPS: Dict[str, Tuple[str, ...]] = {
     "spoofing": (
         "animation-timing",
-        "audio-frequency-noise",
+        "audio-matches-stock",
         "baseline-protections",
+        "context-app-version",
+        "context-http-user-agent",
         "context-lists-across-processes",
         "context-os-system-font",
+        "cpu-vendor-estimates",
+        "detached-window-stock-values",
+        "display-scale-resolution",
         "fingerprint-setter-seal",
         "ipv4-only-network",
         "locale-explicit-names",
         "media-devices-coherence",
+        "navigation-preconnect-proxied",
+        "offscreen-webgl2-follows-canvas",
         "spoofed-voice-speaks",
         "startup-prefs",
+        "startup-size-frame-extents",
+        "system-font-alias-stall",
         "system-ui-font-spoofing",
         "timezone-stable",
         "touchscreen-digitizer",
         "webgl-live-state",
         "webgl-renderer-pair",
+        "webgl-spoofed-limit-cost",
         "webrtc-context-ip",
         "webrtc-port-range",
+        "webrtc-proxy-local-network",
+        "webrtc-proxy-no-udp-around",
+        "webrtc-socks5-udp",
         "worker-config-reads",
     ),
     "automation": (
         "addons-install-once",
+        "closed-page-released",
+        "context-process-isolation",
         "debug-logging-off",
+        "driver-stack-frames",
+        "fonts-ready-driver",
         "force-scope-access",
-        "humanize-edge-deadlock",
-        "humanize-mouse-trajectory",
-        "humanize-pacing",
+        "humanize",
         "input-ack-backstop",
         "isolated-evaluate",
+        "long-press-no-link-preview",
         "main-world-eval",
+        "main-world-eval-globals",
         "main-world-init-script",
         "mouse-boundary-sweep",
         "near-edge-mouse-deadlock",
         "noop-mousemove-deadlock",
         "occluded-window-active",
+        "pointer-lock-offscreen",
+        "screenshot-canvas-release",
+        "socks5-proxy-auth",
+        "tab-switch-budget",
         "trusted-events",
+        "ubo-lists-frozen",
         "visible-automation-cues",
+        "webdriver-bidi-tabs",
     ),
     "parity": (
+        "bare-launch-host-fonts",
+        "certificate-revocations",
         "contentaccessible-parity",
+        "css-device-size-fractional",
+        "driven-click-count",
+        "driven-drag-gtk",
+        "driven-evaluate-globals",
+        "driven-fill-paste",
+        "driven-global-order",
+        "driven-input-timestamp-grid",
+        "driven-key-repeat",
+        "driven-move-coalescing",
+        "driven-move-device-pixels",
+        "driven-page-real-focus",
+        "driven-right-click-order",
+        "driven-wheel-notches",
+        "enterprise-policies",
         "firefox-version-pin",
+        "getter-cost-parity",
         "gfx-probes-packaged",
-        "hardware-acceleration-policy",
+        "headless-software-webgl",
+        "juggler-initial-blank-context",
+        "juggler-input-gate",
+        "nimbus-without-normandy",
+        "no-background-traffic",
+        "playwright-window-size",
         "popup-blocker-parity",
+        "popup-covered-click",
         "popup-window-size",
+        "release-rollouts",
+        "screenshot-leaves-page",
         "search-service-init",
+        "startup-size-hold-yields",
         "stock-gpu-parity",
         "stock-parity-probes",
+        "system-font-size-windows",
+        "tracking-protection-lists",
         "viewport-no-rdm",
+        "virtual-display-window-visible",
+        "windows-crt-math",
         "windows-exe-manifest",
+        "windows-keyboard",
     ),
 }
 
@@ -99,6 +153,30 @@ def gate_name(group: Optional[str]) -> str:
 def guards() -> List[Path]:
     """Every guard script. helpers.py is a library, not a guard."""
     return sorted(p for p in GUARD_DIR.glob("*.py") if p.name != "helpers.py")
+
+
+def leftover_browsers(binary: Path) -> List[str]:
+    """Processes of the browser still running after a guard, with CPU seconds.
+
+    Guards share one runner. A browser a guard failed to close keeps its
+    content processes -- and any spinning workers -- alive into every later
+    guard, which then sees a slower machine than it was written for. On Linux
+    those content processes run plugin-container, which sits beside the binary.
+    """
+    binary = binary.resolve()
+    exes = {str(binary), str(binary.parent / "plugin-container")}
+    ticks = os.sysconf("SC_CLK_TCK")
+    found = []
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            if os.readlink(proc / "exe") not in exes:
+                continue
+            fields = (proc / "stat").read_text().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        cpu = (int(fields[11]) + int(fields[12])) / ticks
+        found.append(f"pid {proc.name} cpu {cpu:.1f}s")
+    return found
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -147,8 +225,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             failed.append(guard.name)
             tail = proc.combined().strip().splitlines()[-6:]
             result.note(f"{guard.name} failed ({proc.code}): " + " | ".join(t.strip() for t in tail))
+            # The note keeps six lines; the job log gets all of it.
+            log(f"  ✗ {guard.name} output:\n{proc.combined().strip()}")
         else:
             log(f"  ✓ {guard.name}")
+        leftovers = leftover_browsers(binary)
+        if leftovers:
+            log(f"  {guard.name} left {len(leftovers)} browser processes running: {', '.join(leftovers)}",
+                level="WARN")
 
     passed = len(selected) - len(failed)
     result.note(f"{passed}/{len(selected)} guards passed")

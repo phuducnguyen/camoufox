@@ -35,6 +35,9 @@ npx camoufox fetch
 
 `camoufox fetch` installs the browser build this release is paired with.
 Without it, the first launch downloads it.
+It reads the build's release with one GitHub API call and exits non-zero
+when it installs nothing. On a shared CI runner, set `GITHUB_TOKEN` to raise
+GitHub's API rate limit.
 
 ## Usage
 
@@ -89,7 +92,7 @@ await context.close();
 ### One browser, many identities
 
 `NewContext()` gives each context its own identity (navigator, screen, WebGL,
-fonts, voices, audio seed, timezone, WebRTC IP), applied through
+fonts, voices, timezone, WebRTC IP), applied through
 `addInitScript` before any page script runs.
 
 ```javascript
@@ -112,7 +115,7 @@ await browser.close();
 | `os` | `"windows"`, `"macos"` or `"linux"` for the drawn identity. On a browser without canvas noise, the host's OS, and anything else throws `ValueError`. |
 | `ff_version` | Firefox major version claimed in the User-Agent. Defaults to the browser's own. |
 | `webrtc_ip` | IPv4 or IPv6 address WebRTC reports. |
-| `proxy` | Per-context proxy, in Playwright's format. Unless `webrtc_ip` and `timezoneId` are both given, they are looked up from the proxy's exit IP, and `InvalidIP` is thrown if the lookup fails. |
+| `proxy` | Per-context proxy, in Playwright's format. The context is placed where the proxy exits: `webrtc_ip`, `timezoneId`, `locale` and `geolocation` each default to the exit IP's, looked up through the proxy unless all four are given, and `InvalidIP` is thrown if the lookup fails. |
 | `geolocation` | `{ latitude, longitude }`; also grants the `geolocation` permission. |
 | anything else | Passed to Playwright's `browser.newContext()` (camelCase, e.g. `timezoneId`), overriding the generated value. |
 
@@ -120,6 +123,16 @@ Canvas noise belongs to the browser, not the context (see
 [The canvas on another OS](#the-canvas-on-another-os)). On a browser without it,
 every context claims the host's OS and GPU too, since its canvas renders there.
 Contexts with other OSes, like the ones above, need `canvas_noise: true`.
+
+The browser's own OS also decides some things for all its contexts. A browser
+launched as Windows on a Linux or macOS host (`os: "windows"`, or drawn so)
+computes `Math` as the Windows CRT does and uses Windows' keyboard shortcuts
+(on a Linux host; on macOS only the editor caret style), middle-click and
+scrollbars ([docs/HOST-PARITY.md](../docs/HOST-PARITY.md)).
+Those are browser settings, so a macOS context on it has them too, and a
+Windows context on a browser launched as another OS has the host's. `NewContext`
+does not refuse the mix. Pass `os` at launch for the OS whose behaviour matters,
+or use one browser per OS.
 
 ### The canvas on another OS
 
@@ -129,8 +142,10 @@ come from the real OS, driver and GPU, whatever the identity claims.
 - **On the host's OS**, the launcher starts the browser once, unspoofed and with
   the same display, reads the GPU Firefox reports, and the identity claims it.
   The pixels then agree with the identity. A host that renders in software (no
-  GPU driver, as on most servers) keeps a drawn GPU: it reads as a machine
-  whose driver failed to load.
+  working GPU driver, as on most servers) claims its software renderer, such as
+  `llvmpipe` on Linux. Firefox reads the name and the pixels from one GL context,
+  so a machine with a broken driver reports the software renderer too, and a GPU
+  name over software pixels never happens on a real machine.
 - **On another OS, or with another GPU** (`webgl_config`, a preset's GPU, or a
   host GPU fpgen never recorded), the pixels would show the real one. Camoufox
   then turns on the canvas protection of `privacy.resistFingerprinting`, and
@@ -209,6 +224,91 @@ window size is spoofed, and to the host's own color scheme and motion settings.
 `launchOptions()` returns Playwright's camelCase keys (`executablePath`,
 `firefoxUserPrefs`), and does not handle `headless: "virtual"` or `"virtual-gpu"`.
 
+### Human input
+
+The browser does not humanize input: each Playwright call reaches the page as one native-looking event ([docs/humanize.md](../docs/humanize.md)). Humanization belongs to the driver. The `humanize` option picks an engine per channel, run in your own process:
+
+```ts
+import { Camoufox, myuri, raw } from "camoufox";
+
+// `humanize: true` is myuri() on every channel
+const browser = await Camoufox({
+	humanize: {
+		scroll: raw(),
+		seed: 1234,
+		settings: { mouse: { speedFactor: 2 }, typing: { wpm: 90 } },
+	},
+});
+await browser.close();
+```
+
+- `myuri()` is [myuri](https://github.com/JWriter20/Myuri)'s smart actions, fitted to recordings of people on each OS and drawn for the launch identity's OS: the path, the press, the typing and the wheel turns, and the decisions around a click (scroll the element into view, choose the point, check that the press lands, try again when it does not). The package depends on it (`@jwriter20/myuri`), pinned to the release it was tested with.
+- `cursory()` is another name for `myuri()`: myuri runs cursory's paths.
+- `raw()` is Playwright as it is.
+- A channel an object leaves out is `myuri()`. `humanize: null` or `false`, the default, is `raw()` everywhere.
+- `settings` are [myuri's settings](https://github.com/JWriter20/Myuri#settings): mouse, scroll and typing speed, overshoot, typing mistakes and pauses. Pass any subset; the rest keep myuri's defaults, and an unknown key throws before launch. The `seed` draws one person around them, each speed within ±`variation` (0.2) of the value set; `{ variation: 0 }` plays them exactly.
+
+### Replacing a part
+
+Each piece of myuri is a part you can replace with a function of yours, in your own process. The rest stay myuri's, so a scroll of your own still serves myuri's clicks, and your move still ends where myuri presses.
+
+```ts
+import { setTimeout as sleep } from "node:timers/promises";
+import { Camoufox, myuri } from "camoufox";
+
+const browser = await Camoufox({
+	humanize: {
+		// a pause to look, then myuri's path
+		mouse: myuri({
+			move: async (page, x, y, { default: path, rng }) => {
+				await sleep(100 + 200 * rng());
+				await path();
+			},
+		}),
+		// Playwright's own scroll; `default()` would be myuri's wheel turns
+		scroll: myuri({
+			intoView: (page, locator) => locator.scrollIntoViewIfNeeded(),
+		}),
+		settings: { typing: { wpm: 70 } },
+		seed: 1234,
+	},
+});
+const page = await browser.newPage();
+await page.setContent('<button id="submit" style="margin-top:3000px">Send</button>');
+await page.locator("#submit").click();
+await browser.close();
+```
+
+| Channel | Part | Called as | myuri's part |
+|---|---|---|---|
+| `mouse` | `move` | `fn(page, x, y, ctx)` | a path from the cursor to (x, y) |
+| | `press` | `fn(page, button, clickCount, ctx)` | the dwell, then each press and its hold |
+| | `point` | `fn(page, box, attempt, ctx)`, returns `[x, y]` | where in the element's visible box to aim; `attempt` counts the misses |
+| | `reaches` | `fn(page, locator, x, y, pressing, ctx)`, returns `null` or why it misses | whether a press at (x, y) lands on the element: not covered, enabled |
+| `scroll` | `intoView` | `fn(page, locator, ctx)` | wheel turns until the element is in view, waiting for each scroll to land |
+| | `wheel` | `fn(page, dx, dy, ctx)` | one scroll split into wheel notches |
+| `keyboard` | `type` | `fn(page, text, ctx)` | keys at a person's rhythm, with the mistakes they make |
+| | `key` | `fn(page, key, ctx)` | one key or chord (`"Enter"`, `"Control+a"`) |
+
+`ctx` is `{ default, rng, play }`:
+
+- `default(...args)` runs myuri's part, with the same arguments when given none. A part that only adjusts myuri wraps it.
+- `rng()` returns a float in [0, 1) from the humanize seed's stream: one stream per browser, number for number what the Python launcher draws for that seed.
+- `play(steps)` dispatches steps at their times, in ms from the start of the call: `["move", x, y, t]`, `["down" | "up", button, t]`, `["wheel", dx, dy, t]` (one wheel event each), `["key", key, "down" | "up", t]`, `["text", text, t]`. A slow round trip delays one step and never adds up. Bad steps reject before anything is sent.
+- Playwright calls inside a part are Playwright's own: `page.mouse.move` in a move part moves the mouse once. A part that throws rejects the call.
+
+What each channel drives:
+
+| Channel | For |
+|---|---|
+| `mouse` | `Mouse.move`/`click`/`dblclick`; `click`, `dblclick`, `hover`, `check` and `uncheck` on a `Page`, `Frame` or `Locator`, and the click that focuses a field before `fill` |
+| `keyboard` | `Keyboard.type`/`press`; `fill`, `type`, `press` on a `Page`, `Frame` or `Locator`, and `Locator.pressSequentially` |
+| `scroll` | `Mouse.wheel`, `Locator.scrollIntoViewIfNeeded`, and bringing an element into view before a pointer action, fill or typing |
+
+- A click that never reaches its element rejects with Playwright's `TimeoutError` at the call's timeout, naming what covers the point. `trial: true` goes to Playwright alone, and `force: true` skips the reach check.
+- `ElementHandle` methods, `tap`, `dragAndDrop` and `dragTo` are Playwright's own.
+- The wrappers belong to the browser `Camoufox()` launched. For a browser from `connect()`, launch it without humanize and call `attach(browser, humanize, os)` with its identity's OS. Over a network each event is a round trip, so the launcher warns. `launchServer()` refuses any engine but `raw()`.
+
 ## Launch options
 
 `Camoufox()`, `NewBrowser()`, `launchServer()` and `launchOptions()` take one
@@ -222,11 +322,11 @@ names. Any other key is passed to Playwright's `firefox.launch()` (or
 | `headless` | `boolean \| "virtual" \| "virtual-gpu"` | `false` | See [Headless modes](#headless-modes). |
 | `gpu` | `string \| number` | `CAMOUFOX_GPU`, or the only GPU | The card for `headless: "virtual-gpu"`. Not taken by `launchOptions()`. |
 | `require_gpu` | `boolean` | `true` | With `headless: "virtual-gpu"`, fail the launch when the browser does not render on the card; `false` warns. Not taken by `launchOptions()`. |
-| `proxy` | `{ server, username?, password?, bypass? }` | none | Playwright proxy. |
+| `proxy` | `{ server, username?, password?, bypass? }` | none | Playwright proxy. A `socks5://` proxy can have a username and password too (RFC 1929), which Playwright alone refuses; the same holds for `NewContext()` and `newContext()`. |
 | `geoip` | `boolean \| string` | none | `true` finds the public IP (through `proxy` if set); a string uses that IP. Sets timezone, locale, geolocation and the WebRTC IP. Without a proxy, also decides whether IPv6 stays on. |
 | `geoip_db` | `string` | the `camoufox set --geoip` choice | GeoIP database name, e.g. `"GeoIP AIO by daijro"`. |
 | `locale` | `string \| string[]` | from `geoip`, else the drawn identity's | Locale(s), e.g. `"en-US"`. The first is used for `Intl`. |
-| `humanize` | `boolean \| number` | off | Human cursor movement. A number caps one movement at that many seconds (default cap 1.5). |
+| `humanize` | `boolean \| object` | every channel raw | Driver-side input. `true` is [`myuri()`](#human-input) on every channel; an object picks per channel (`mouse`, `keyboard`, `scroll`) `myuri()`, `myuri({ part: fn })` or `raw()`, an omitted channel being `myuri()`, plus an integer `seed` in [0, 2\*\*32) and myuri's `settings`. The browser never humanizes input; a number is refused. |
 | `screen` | `Screen \| { max_width?, max_height?, min_width?, min_height? }` | the real display when headed | Bounds the generated screen. |
 | `window` | `[number, number]` | generated | Fixed outer window size. |
 | `fonts` | `string[]` | none | Extra font families on top of the OS's own. |
@@ -237,6 +337,7 @@ names. Any other key is passed to Playwright's `firefox.launch()` (or
 | `block_webrtc` | `boolean` | `false` | Disable WebRTC entirely. |
 | `block_webgl` | `boolean` | `false` | Disable WebGL. Warns: many WAFs check for it. |
 | `webgl_config` | `[vendor, renderer]` | drawn | Use one GPU fpgen has recorded for Firefox on `os`; any other pair throws. Needs `os`. |
+| `cpu` | `{ arch?: "x86" \| "arm", manufacturer?: string }` | follows the GPU and cores, else x86 drawn | The CPU the identity computes as: canvas, Web Audio, Opus, relaxed-SIMD wasm and NaN signs differ between x86-64 and ARM64, and canvas and Opus between Intel and AMD. A manufacturer alone implies its arch. Per OS: macos x86 `intel`, arm `apple`; windows x86 `intel`/`amd`, arm `qualcomm`; linux x86 `intel`/`amd`, arm `apple`, `qualcomm`, `broadcom`, `nvidia`, `ampere`, `rockchip`, `mediatek`, `amlogic`, `allwinner`. A pair no machine on the OS has, or one the GPU contradicts, throws `ValueError`; without `os`, the OS is drawn among those with a recorded GPU for the CPU. By default an Apple GPU is Apple ARM, an Intel iGPU or Intel Mac Intel, a Radeon iGPU AMD, and 10, 14, 18, 22 or 28 logical cores Intel; otherwise x86, 81% Intel. ARM64 is emulated on an x86-64 host, and Intel or AMD x86-64 on an ARM64 host. |
 | `canvas_noise` | `boolean` | on for another OS or GPU | Random canvas and WebGL readback, as in LibreWolf. Warns. See [The canvas on another OS](#the-canvas-on-another-os). |
 | `disable_coop` | `boolean` | `false` | Turn off Cross-Origin-Opener-Policy so elements in cross-origin iframes (such as the Turnstile checkbox) can be clicked. Warns. |
 | `main_world_eval` | `boolean` | `false` | Allow `page.evaluate("mw:...")` and `mw:` init scripts to run in the page's own world. |
@@ -246,7 +347,7 @@ names. Any other key is passed to Playwright's `firefox.launch()` (or
 | `fingerprint` | fpgen fingerprint object | drawn | Use this fpgen fingerprint instead of drawing one. Warns. |
 | `fingerprint_preset` | `boolean \| object` | `undefined` | Opt into a recorded real-device preset instead of fpgen: `true` picks a random bundled one, an object uses that one. |
 | `ff_version` | `number` | the browser's own | Firefox version to claim. Warns: a mismatch with the engine is detectable. |
-| `config` | `object` | none | Raw Camoufox properties ([`properties.json`](https://github.com/daijro/camoufox/blob/main/browser/settings/properties.json)). Overrides the generated identity; manual identity keys warn. |
+| `config` | `object` | none | Raw Camoufox properties ([`properties.json`](https://github.com/daijro/camoufox/blob/main/browser/settings/properties.json)). Overrides the generated identity; manual identity keys warn. A value you set is always used; one no real machine with the rest of the identity reports prints a `LeakWarning` naming it, which `i_know_what_im_doing` does not silence. |
 | `firefox_user_prefs` | `object` | none | Extra Firefox prefs. |
 | `args` | `string[]` | none | Extra browser command-line arguments. |
 | `env` | `object` | a copy of `process.env` | Environment variables for the browser. |
@@ -266,7 +367,7 @@ and `from_options` (an object from `launchOptions()` to use as is).
 
 | Command | Options | What it does |
 |---|---|---|
-| `fetch [version]` | | Install the paired build (or, after `set`, the latest in the chosen channel), or `version` without making it active. Syncs first. |
+| `fetch [version]` | | Install the paired build (or, after `set`, the latest in the chosen channel), or `version` without making it active. A named or paired build is read from its own release; anything else syncs first. Exits non-zero when nothing is installed. |
 | `sync` | `--spoof-os auto\|mac\|win\|lin`, `--spoof-arch auto\|x86_64\|i686\|arm64` | Refresh the list of available builds. |
 | `set [specifier]` | `--geoip`, `--release` | Pin a build (`official/stable/134.0.2-beta.20`) or follow a channel (`official/stable`). No specifier opens a picker. `--geoip` picks the GeoIP database instead; `--release` goes back to the paired build. |
 | `active` | | Print the active build. A build that is chosen but not downloaded is marked `(not fetched)`. |

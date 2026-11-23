@@ -104,6 +104,13 @@ export interface LauncherConstants {
 	windows11MarkerFonts: string[];
 	plausibleCoreCounts: number[];
 	appleSiliconCores: number[];
+	x86IntelShare: number;
+	cpuIdentityPref: Record<"x86/intel" | "x86/amd" | "arm", number>;
+	cpuManufacturers: Record<
+		"mac" | "windows" | "linux",
+		Record<"x86" | "arm", string[]>
+	>;
+	intelOnlyCoreCounts: number[];
 	appleSiliconPanels: Record<string, [number, number][]>;
 	intelMacIgpCores: number[];
 	intelMacDgpuExtraCores: number[];
@@ -113,12 +120,13 @@ export interface LauncherConstants {
 	baselineTaskbarHeight: Record<"win" | "mac" | "lin", number>;
 	baselineMultiTouchPoints: number;
 	cachePrefs: Record<string, any>;
+	windowsBehaviourPrefs: Record<string, any>;
 }
 export const LAUNCHER_CONSTANTS: Readonly<LauncherConstants> = loadDataFile(
 	"launcher-constants.json",
 );
 
-// Camoufox keeps the fpgen model in its cache, beside the browsers and addons.
+// Camoufox keeps the fpgen model in its cache, beside the browsers.
 setModelDir(process.env.CAMOUFOX_FPGEN_DATA || path.join(INSTALL_DIR, "fpgen"));
 
 export const OS_ARCH_MATRIX: Record<string, string[]> = {

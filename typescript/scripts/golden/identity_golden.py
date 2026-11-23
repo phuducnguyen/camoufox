@@ -550,14 +550,23 @@ def record_coherence():
         if rng.random() < 0.2:
             c['screen.width'], c['screen.height'] = rng.choice(sorted(coherence.APPLE_SILICON_PANELS))
         target = rng.choice(OS_KEYS + ('bsd',))
-        v = [list(x) for x in coherence.validate(c, target)]
+        v = [[x.rule, x.detail] for x in coherence.validate(c, target)]
         applied = copy.deepcopy(c)
-        left = [list(x) for x in coherence.apply(applied, target)]
+        left = [[x.rule, x.detail] for x in coherence.apply(applied, target)]
         dropped_cfg = copy.deepcopy(c)
-        dropped = [list(x) for x in coherence.drop_incoherent_source_values(dropped_cfg, target)]
+        dropped = [[x.rule, x.detail] for x in coherence.drop_incoherent_source_values(dropped_cfg, target)]
+        # The same identity with some of its keys the caller's: those are not repaired.
+        keep = sorted(key for key in c if rng.random() < 0.3)
+        kept_cfg = copy.deepcopy(c)
+        kept_left = [[x.rule, x.detail, list(x.kept)] for x in coherence.apply(kept_cfg, target, set(keep))]
+        kept_dropped_cfg = copy.deepcopy(c)
+        kept_dropped = [[x.rule, x.detail, list(x.kept)]
+                        for x in coherence.drop_incoherent_source_values(kept_dropped_cfg, target, set(keep))]
         case = {'input': c, 'os': target, 'rules': [x[0] for x in v], 'validate': h(v),
                 'apply': [x[0] for x in left], 'applyHash': h(left), 'applied': h(applied),
                 'dropped': dropped, 'droppedConfig': h(dropped_cfg),
+                'keep': keep, 'keptApply': h(kept_left), 'keptApplied': h(kept_cfg),
+                'keptDropped': kept_dropped, 'keptDroppedConfig': h(kept_dropped_cfg),
                 'implausible': coherence.screen_is_implausible(c)}
         if i < 40:
             case.update(validateFull=v, appliedFull=applied)
@@ -707,9 +716,9 @@ def record_constants():
 def record_init_script():
     cases = [
         {},
-        {'audioFingerprintSeed': 123,
-         'navigatorPlatform': 'Win32', 'navigatorOscpu': 'Windows NT 10.0; Win64; x64',
-         'navigatorUserAgent': UAS[3], 'hardwareConcurrency': 8, 'webglVendor': 'Google Inc. (Intel)',
+        {'navigatorPlatform': 'Win32', 'navigatorOscpu': 'Windows NT 10.0; Win64; x64',
+         'navigatorUserAgent': UAS[3], 'navigatorAppVersion': '5.0 (Windows)', 'hardwareConcurrency': 8,
+         'webglVendor': 'Google Inc. (Intel)',
          'webglRenderer': 'ANGLE (Intel, "quoted" é)', 'screenWidth': 1920, 'screenHeight': 1080,
          'screenColorDepth': 24, 'timezone': 'Europe/Paris', 'fontList': ['Arial', '微软雅黑', 'Segoe UI'],
          'speechVoices': [{'name': 'Microsoft David'}, 'Plain Name'], 'webrtcIP': '1.2.3.4'},

@@ -10,6 +10,7 @@ Run:
 """
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -20,9 +21,11 @@ from _mixin import (
     get_moz_target,
     get_options,
     list_patches,
+    mozilla_rust_version,
     run,
     temp_cd,
 )
+import pgo
 
 options, args = get_options()
 
@@ -46,25 +49,25 @@ class Patcher:
 
     moz_target: str
     target: str
+    rust: str
+    pgo_profile: str
 
     def camoufox_patches(self):
         """
-        Apply all patches
+        Apply all patches, or with --mozconfig-only retarget the patched tree
         """
         version, release = extract_args()
         with temp_cd(find_src_dir('.', version, release)):
-            # Reset only when the source tree has its own local repository.
-            reset_to_unpatched()
+            if not options.mozconfig_only:
+                # Reset only when the source tree has its own local repository.
+                reset_to_unpatched()
 
-            # Re-copy additions and settings after reset
-            print("Re-copying additions and settings...")
-            run(f'bash ../scripts/copy-additions.sh {version} {release}')
+                # Re-copy additions and settings after reset
+                print("Re-copying additions and settings...")
+                run(f'bash ../scripts/copy-additions.sh {version} {release}')
 
-            # Create the base mozconfig file
-            run('cp -v ../assets/base.mozconfig mozconfig')
-            # Set cross building target
             print(f'Using target: {self.moz_target}')
-            self._update_mozconfig()
+            self._write_mozconfig()
 
             if not options.mozconfig_only:
                 failed_patches = []
@@ -132,54 +135,57 @@ class Patcher:
             rejects.append(f'patch exited with status {result.returncode}')
         return rejects
 
-    def _update_mozconfig(self):
+    def _write_mozconfig(self):
         """
-        Helper for adding additional mozconfig code from assets/<target>.mozconfig
+        Write the mozconfig: the target, assets/base.mozconfig, then assets/<target>.mozconfig
         """
-        mozconfig_backup = "mozconfig.backup"
-        mozconfig = "mozconfig"
-
-        # Create backup if it doesn't exist
-        if not os.path.exists(mozconfig_backup):
-            if os.path.exists(mozconfig):
-                shutil.copy2(mozconfig, mozconfig_backup)
-            else:
-                with open(mozconfig_backup, 'w', encoding='utf-8') as f:
-                    pass
-
-        # Read backup content
-        with open(mozconfig_backup, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        # Add target option
-        content += f"\nac_add_options --target={self.moz_target}\n"
-
-        # Add target-specific mozconfig if it exists
+        # Set first: base.mozconfig picks stock's LTO mode for the target and
+        # reads the profile. configure resolves rustc and cargo through rustup,
+        # which honours RUSTUP_TOOLCHAIN.
+        content = (f"CAMOUFOX_TARGET={self.moz_target}\n"
+                   f"CAMOUFOX_PGO_PROFILE={self.pgo_profile}\n"
+                   "ac_add_options --target=$CAMOUFOX_TARGET\n"
+                   f"export RUSTUP_TOOLCHAIN={self.rust}\n\n")
+        with open(os.path.join("..", "assets", "base.mozconfig"), encoding='utf-8') as f:
+            content += f.read()
+        # Linux has no mozconfig of its own
         target_mozconfig = os.path.join("..", "assets", f"{self.target}.mozconfig")
         if os.path.exists(target_mozconfig):
-            with open(target_mozconfig, 'r', encoding='utf-8') as f:
+            with open(target_mozconfig, encoding='utf-8') as f:
                 content += f.read()
 
-        # Update mozconfig
-        print(f"-> Updating mozconfig, target is {self.moz_target}")
-        with open(mozconfig, 'w', encoding='utf-8') as f:
+        print(f"-> Writing mozconfig, target is {self.moz_target}")
+        with open("mozconfig", 'w', encoding='utf-8') as f:
             f.write(content)
 
 
-def add_rustup(*targets):
-    """Add rust targets"""
-    for rust_target in targets:
-        run(f'~/.cargo/bin/rustup target add "{rust_target}"')
+RUST_TARGETS = {
+    "linux": ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"),
+    "windows": ("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc", "i686-pc-windows-msvc"),
+    "macos": ("x86_64-apple-darwin", "aarch64-apple-darwin"),
+}
 
 
-def _update_rustup(target):
-    """Add rust targets for the given target"""
-    if target == "linux":
-        add_rustup("aarch64-unknown-linux-gnu")
-    elif target == "windows":
-        add_rustup("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc", "i686-pc-windows-msvc")
-    elif target == "macos":
-        add_rustup("x86_64-apple-darwin", "aarch64-apple-darwin")
+def find_rustup():
+    """The rustup binary the build drives.
+
+    rustup.sh installs to ~/.cargo/bin, but a distro or Homebrew package puts
+    it somewhere on PATH (/usr/bin, /opt/homebrew/bin). Look on PATH first,
+    then the rustup.sh default, and fail loudly when neither exists.
+    """
+    rustup = shutil.which("rustup") or os.path.expanduser("~/.cargo/bin/rustup")
+    if not os.access(rustup, os.X_OK):
+        raise SystemExit(
+            "rustup not found on PATH or at ~/.cargo/bin/rustup; "
+            "install it with browser/scripts/install-deps.sh and open a new shell"
+        )
+    return rustup
+
+
+def install_rust(rust, target):
+    """Install the Rust release Mozilla builds this tree with, and its std for the target"""
+    targets = ' '.join(f'--target {t}' for t in RUST_TARGETS[target])
+    run(f'{shlex.quote(find_rustup())} toolchain install {rust} --profile minimal {targets}')
 
 
 """
@@ -207,7 +213,9 @@ def extract_build_target():
         assert target in AVAILABLE_TARGETS, f"Unsupported target: {target}"
         assert arch in AVAILABLE_ARCHS, f"Unsupported architecture: {arch}"
     else:
-        target, arch = "macos", "arm64"
+        # The documented build (README, AGENTS.md "Building") runs on Linux;
+        # make build/run/edit-cfg assume the obj-x86_64-pc-linux-gnu objdir.
+        target, arch = "linux", "x86_64"
     return target, arch
 
 
@@ -221,15 +229,18 @@ if __name__ == "__main__":
 
     TARGET, ARCH = extract_build_target()
     MOZ_TARGET = get_moz_target(TARGET, ARCH)
-    _update_rustup(TARGET)
 
     # Check if the folder exists
     if not os.path.exists(f'camoufox-{VERSION}-{RELEASE}/configure.py'):
         sys.stderr.write('error: folder doesn\'t look like a Firefox folder.')
         sys.exit(1)
 
+    RUST = mozilla_rust_version(f'camoufox-{VERSION}-{RELEASE}')
+    install_rust(RUST, TARGET)
+    PGO_PROFILE = pgo.fetch(TARGET, ARCH, VERSION)
+
     # Apply the patches
-    patcher = Patcher(MOZ_TARGET, TARGET)
+    patcher = Patcher(MOZ_TARGET, TARGET, RUST, PGO_PROFILE)
     patcher.camoufox_patches()
 
     sys.exit(0)  # ensure 0 exit code

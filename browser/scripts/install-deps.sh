@@ -20,32 +20,26 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # rustup / cargo (all platforms)
 # ---------------------------------------------------------------------------
 install_rust() {
-  if have rustc && have cargo; then
-    log "Rust already installed ($(rustc --version))"
+  # The build needs rustup, not a toolchain: scripts/patch.py installs the Rust
+  # release Mozilla builds the tree with, so a distro rustc and cargo is not enough.
+  if have rustup; then
+    log "rustup already installed ($(rustup --version 2>/dev/null))"
   else
-    # cargo may be installed but not on PATH yet in this shell.
+    # rustup may be installed but not on PATH yet in this shell.
     if [ -f "$HOME/.cargo/env" ]; then
       # shellcheck disable=SC1091
       . "$HOME/.cargo/env"
     fi
-    if have rustc && have cargo; then
-      log "Rust found via ~/.cargo/env ($(rustc --version))"
+    if have rustup; then
+      log "rustup found via ~/.cargo/env ($(rustup --version 2>/dev/null))"
     else
-      log "Installing Rust via rustup..."
+      log "Installing rustup..."
       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --default-toolchain stable
       # shellcheck disable=SC1091
       . "$HOME/.cargo/env"
-      log "Installed $(rustc --version)"
+      log "Installed $(rustup --version 2>/dev/null)"
     fi
-  fi
-
-  # `mach configure` aborts with "Cannot compile for <target>" without the std
-  # target, and scripts/patch.py adds only the aarch64 Linux one.
-  if have rustup; then
-    log "Ensuring Rust Linux cross-compile targets (x86_64/aarch64)..."
-    rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
-      || warn "Could not add Rust Linux targets; if cross-compiling to Linux, run: rustup target add x86_64-unknown-linux-gnu"
   fi
 }
 
