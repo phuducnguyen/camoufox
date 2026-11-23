@@ -78,7 +78,7 @@ index 576a321..d21f58e 100644
 +        }
 +        mWidth = aWidth;
 +        mHeight = aHeight;
-+        mFrame = std::move(frame);
++        mFrame.Assign(std::move(frame));
 +        mFrameData = std::move(data);
 +      })));
 +
@@ -373,7 +373,7 @@ index 0000000..464b0cc
 +  if (!mHasFrame) {
 +    return false;
 +  }
-+  aOut = mFrame;
++  aOut.Assign(mFrame);
 +  *aWidth = mWidth;
 +  *aHeight = mHeight;
 +  return true;
@@ -395,7 +395,8 @@ index 0000000..464b0cc
 +  while (!mStop) {
 +    HANDLE handle = INVALID_HANDLE_VALUE;
 +    for (int attempt = 0; attempt < kConnectAttempts && !mStop; ++attempt) {
-+      handle = ::CreateFileW(reinterpret_cast<const wchar_t*>(mName.get()),
++      handle = ::CreateFileW(
+          reinterpret_cast<const wchar_t*>(static_cast<const char16_t*>(mName.get())),
 +                             GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
 +                             nullptr, OPEN_EXISTING, 0, nullptr);
 +      if (handle != INVALID_HANDLE_VALUE) {
@@ -436,7 +437,7 @@ index 0000000..464b0cc
 +      }
 +      {
 +        MutexAutoLock lock(mMutex);
-+        mFrame = std::move(frame);
++        mFrame.Assign(std::move(frame));
 +        mWidth = static_cast<int32_t>(width);
 +        mHeight = static_cast<int32_t>(height);
 +        mHasFrame = true;
