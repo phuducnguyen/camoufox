@@ -71,16 +71,17 @@ diff --git a/gfx/thebes/gfxPlatformFontList.h b/gfx/thebes/gfxPlatformFontList.h
  
    // When system-wide font lookup fails for a character, cache it to skip future
 diff --git a/dom/base/nsScreen.cpp b/dom/base/nsScreen.cpp
-index 2b72572..8a58068 100644
+index 2b72572..b133e7e 100644
 --- a/dom/base/nsScreen.cpp
 +++ b/dom/base/nsScreen.cpp
-@@ -247,21 +247,15 @@ CSSIntRect nsScreen::GetAvailRect() {
+@@ -247,21 +247,18 @@ CSSIntRect nsScreen::GetAvailRect() {
      }
      return CSSIntRect::FromAppUnitsRounded(context->GetClientRect());
    }();
 -  if (availFromResolution || detached) {
--    return stock;
--  }
++  if (detached) {
+     return stock;
+   }
 -  // Camoufox: the per-context API sets one size, so the available rect is the
 -  // whole screen. That matches the generated fingerprints, whose availWidth /
 -  // availHeight equal width / height, and keeps availWidth <= width true.
