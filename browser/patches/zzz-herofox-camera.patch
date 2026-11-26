@@ -251,10 +251,10 @@ index 7431ded..cb6abb9 100644
  
 diff --git a/dom/media/systemservices/HeroCameraPipe.cpp b/dom/media/systemservices/HeroCameraPipe.cpp
 new file mode 100644
-index 0000000..28331e8
+index 0000000..834ae9c
 --- /dev/null
 +++ b/dom/media/systemservices/HeroCameraPipe.cpp
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,309 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this file,
 + * You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -266,6 +266,7 @@ index 0000000..28331e8
 +#include <string>
 +#include <vector>
 +
++#include "HeroCameraScale.h"
 +#include "MaskConfig.hpp"
 +#include "mozilla/RefPtr.h"
 +#include "mozilla/fallible.h"
@@ -282,23 +283,6 @@ index 0000000..28331e8
 +constexpr uint32_t kMaxHeight = 1080;
 +constexpr uint32_t kDefaultWidth = 640;
 +constexpr uint32_t kDefaultHeight = 480;
-+
-+void ScalePlane(const uint8_t* aSrc, int32_t aSrcW, int32_t aSrcH,
-+                uint8_t* aDst, int32_t aDstW, int32_t aDstH) {
-+  std::vector<int32_t> columns(static_cast<size_t>(aDstW));
-+  for (int32_t x = 0; x < aDstW; ++x) {
-+    columns[x] = static_cast<int32_t>(static_cast<int64_t>(x) * aSrcW / aDstW);
-+  }
-+  for (int32_t y = 0; y < aDstH; ++y) {
-+    const uint8_t* row =
-+        aSrc + static_cast<size_t>(static_cast<int64_t>(y) * aSrcH / aDstH) *
-+                   aSrcW;
-+    uint8_t* out = aDst + static_cast<size_t>(y) * aDstW;
-+    for (int32_t x = 0; x < aDstW; ++x) {
-+      out[x] = row[columns[x]];
-+    }
-+  }
-+}
 +
 +}  // namespace
 +
@@ -379,19 +363,8 @@ index 0000000..28331e8
 +                                          int32_t aSrcHeight, uint8_t* aDst,
 +                                          int32_t aDstWidth,
 +                                          int32_t aDstHeight) {
-+  const size_t srcY = static_cast<size_t>(aSrcWidth) * aSrcHeight;
-+  const size_t dstY = static_cast<size_t>(aDstWidth) * aDstHeight;
-+  if (aSrcWidth == aDstWidth && aSrcHeight == aDstHeight) {
-+    memcpy(aDst, aSrc, dstY + dstY / 2);
-+    return;
-+  }
-+  // shortcut: nearest neighbour, only ever used to go down from the native
-+  // size; upgrade to a box filter if a page's downscaled preview looks harsh.
-+  ScalePlane(aSrc, aSrcWidth, aSrcHeight, aDst, aDstWidth, aDstHeight);
-+  ScalePlane(aSrc + srcY, aSrcWidth / 2, aSrcHeight / 2, aDst + dstY,
-+             aDstWidth / 2, aDstHeight / 2);
-+  ScalePlane(aSrc + srcY + srcY / 4, aSrcWidth / 2, aSrcHeight / 2,
-+             aDst + dstY + dstY / 4, aDstWidth / 2, aDstHeight / 2);
++  hero_camera::ScaleI420Cover(aSrc, aSrcWidth, aSrcHeight, aDst, aDstWidth,
++                              aDstHeight);
 +}
 +
 +#ifdef XP_WIN
@@ -593,10 +566,10 @@ index 0000000..28331e8
 +}  // namespace mozilla
 diff --git a/dom/media/systemservices/HeroCameraPipe.h b/dom/media/systemservices/HeroCameraPipe.h
 new file mode 100644
-index 0000000..a389c7d
+index 0000000..e80074f
 --- /dev/null
 +++ b/dom/media/systemservices/HeroCameraPipe.h
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,95 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this file,
 + * You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -648,8 +621,9 @@ index 0000000..a389c7d
 +  /// The size and rate the launcher encodes its frames at.
 +  static void SourceSize(uint32_t* aWidth, uint32_t* aHeight);
 +  static uint32_t SourceFps();
-+  /// Nearest-neighbour I420 resize; a smaller size is what a page asks for when
-+  /// it wants less than the camera's native size.
++  /// Fits an I420 frame into another size the way a camera's cover mode does
++  /// (centre crop to the target's aspect, then a box-filter resize). A page asks
++  /// for a smaller or differently shaped size than the camera's native one.
 +  static void ScaleI420(const uint8_t* aSrc, int32_t aSrcWidth,
 +                        int32_t aSrcHeight, uint8_t* aDst, int32_t aDstWidth,
 +                        int32_t aDstHeight);
@@ -691,11 +665,149 @@ index 0000000..a389c7d
 +}  // namespace mozilla
 +
 +#endif  // DOM_MEDIA_SYSTEMSERVICES_HEROCAMERAPIPE_H_
+diff --git a/dom/media/systemservices/HeroCameraScale.h b/dom/media/systemservices/HeroCameraScale.h
+new file mode 100644
+index 0000000..b4c129b
+--- /dev/null
++++ b/dom/media/systemservices/HeroCameraScale.h
+@@ -0,0 +1,132 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef DOM_MEDIA_SYSTEMSERVICES_HEROCAMERASCALE_H_
++#define DOM_MEDIA_SYSTEMSERVICES_HEROCAMERASCALE_H_
++
++// Plain C++ on purpose (no Gecko types): the resize and the size list are
++// checked by a stand-alone test that is built outside the tree.
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++namespace mozilla::hero_camera {
++
++struct Size {
++  int32_t width;
++  int32_t height;
++};
++
++// The sizes an Android phone's camera lists, largest first. A virtual camera
++// lists its own native size and every one of these that fits inside it, never
++// a size above what the launcher encodes.
++inline constexpr Size kStandardSizes[] = {
++    {1920, 1080}, {1280, 960}, {1280, 720}, {960, 720}, {800, 600},
++    {720, 480},   {640, 480},  {352, 288},  {320, 240}, {176, 144},
++};
++
++/// The n-th listed size for a camera whose frames are aSrcWidth x aSrcHeight
++/// (the native size first). False past the end of the list.
++inline bool NthCapabilitySize(int32_t aSrcWidth, int32_t aSrcHeight,
++                              uint32_t aIndex, Size* aOut) {
++  uint32_t seen = 0;
++  const Size native{aSrcWidth, aSrcHeight};
++  if (seen++ == aIndex) {
++    *aOut = native;
++    return true;
++  }
++  for (const Size& size : kStandardSizes) {
++    if (size.width > aSrcWidth || size.height > aSrcHeight ||
++        (size.width == aSrcWidth && size.height == aSrcHeight)) {
++      continue;
++    }
++    if (seen++ == aIndex) {
++      *aOut = size;
++      return true;
++    }
++  }
++  return false;
++}
++
++/// Resizes one plane's crop rectangle to aDstW x aDstH, averaging the source
++/// pixels each output pixel covers (a box filter), so a downscaled frame does
++/// not shimmer the way a nearest-neighbour one does.
++inline void ScalePlaneBox(const uint8_t* aSrc, int32_t aSrcStride,
++                          int32_t aCropX, int32_t aCropY, int32_t aCropW,
++                          int32_t aCropH, uint8_t* aDst, int32_t aDstW,
++                          int32_t aDstH) {
++  std::vector<int32_t> x0(static_cast<size_t>(aDstW));
++  std::vector<int32_t> x1(static_cast<size_t>(aDstW));
++  for (int32_t x = 0; x < aDstW; ++x) {
++    const int32_t a =
++        aCropX + static_cast<int32_t>(static_cast<int64_t>(x) * aCropW / aDstW);
++    const int32_t b = aCropX + static_cast<int32_t>(
++                                   static_cast<int64_t>(x + 1) * aCropW / aDstW);
++    x0[x] = a;
++    x1[x] = std::max(a + 1, b);
++  }
++  for (int32_t y = 0; y < aDstH; ++y) {
++    const int32_t ya =
++        aCropY + static_cast<int32_t>(static_cast<int64_t>(y) * aCropH / aDstH);
++    const int32_t yb = std::max(
++        ya + 1, aCropY + static_cast<int32_t>(
++                             static_cast<int64_t>(y + 1) * aCropH / aDstH));
++    uint8_t* out = aDst + static_cast<size_t>(y) * aDstW;
++    for (int32_t x = 0; x < aDstW; ++x) {
++      uint32_t sum = 0;
++      for (int32_t sy = ya; sy < yb; ++sy) {
++        const uint8_t* row = aSrc + static_cast<size_t>(sy) * aSrcStride;
++        for (int32_t sx = x0[x]; sx < x1[x]; ++sx) {
++          sum += row[sx];
++        }
++      }
++      const uint32_t count =
++          static_cast<uint32_t>(yb - ya) * static_cast<uint32_t>(x1[x] - x0[x]);
++      out[x] = static_cast<uint8_t>((sum + count / 2) / count);
++    }
++  }
++}
++
++/// Fits an I420 frame into aDstW x aDstH the way a camera's "cover" mode does:
++/// the source is cropped around its centre to the target's aspect ratio, then
++/// resized. A picture is never stretched. All sizes must be even.
++inline void ScaleI420Cover(const uint8_t* aSrc, int32_t aSrcW, int32_t aSrcH,
++                           uint8_t* aDst, int32_t aDstW, int32_t aDstH) {
++  const size_t srcY = static_cast<size_t>(aSrcW) * aSrcH;
++  const size_t dstY = static_cast<size_t>(aDstW) * aDstH;
++  if (aSrcW == aDstW && aSrcH == aDstH) {
++    std::memcpy(aDst, aSrc, dstY + dstY / 2);
++    return;
++  }
++  int32_t cropW = aSrcW;
++  int32_t cropH = aSrcH;
++  if (static_cast<int64_t>(aSrcW) * aDstH > static_cast<int64_t>(aSrcH) * aDstW) {
++    cropW = static_cast<int32_t>(static_cast<int64_t>(aSrcH) * aDstW / aDstH) &
++            ~1;
++  } else {
++    cropH = static_cast<int32_t>(static_cast<int64_t>(aSrcW) * aDstH / aDstW) &
++            ~1;
++  }
++  cropW = std::max<int32_t>(cropW, 2);
++  cropH = std::max<int32_t>(cropH, 2);
++  const int32_t cropX = ((aSrcW - cropW) / 2) & ~1;
++  const int32_t cropY = ((aSrcH - cropH) / 2) & ~1;
++
++  ScalePlaneBox(aSrc, aSrcW, cropX, cropY, cropW, cropH, aDst, aDstW, aDstH);
++  const uint8_t* srcU = aSrc + srcY;
++  const uint8_t* srcV = srcU + srcY / 4;
++  uint8_t* dstU = aDst + dstY;
++  uint8_t* dstV = dstU + dstY / 4;
++  ScalePlaneBox(srcU, aSrcW / 2, cropX / 2, cropY / 2, cropW / 2, cropH / 2,
++                dstU, aDstW / 2, aDstH / 2);
++  ScalePlaneBox(srcV, aSrcW / 2, cropX / 2, cropY / 2, cropW / 2, cropH / 2,
++                dstV, aDstW / 2, aDstH / 2);
++}
++
++}  // namespace mozilla::hero_camera
++
++#endif  // DOM_MEDIA_SYSTEMSERVICES_HEROCAMERASCALE_H_
 diff --git a/dom/media/systemservices/fake_video_capture/device_info_fake.cc b/dom/media/systemservices/fake_video_capture/device_info_fake.cc
-index e0ea5ba..c2a3bb1 100644
+index e0ea5ba..c6efb74 100644
 --- a/dom/media/systemservices/fake_video_capture/device_info_fake.cc
 +++ b/dom/media/systemservices/fake_video_capture/device_info_fake.cc
-@@ -4,15 +4,77 @@
+@@ -4,15 +4,74 @@
  
  #include "device_info_fake.h"
  
@@ -703,6 +815,7 @@ index e0ea5ba..c2a3bb1 100644
  #include <string.h>
  
 +#include "HeroCameraPipe.h"
++#include "HeroCameraScale.h"
 +
  namespace webrtc::videocapturemodule {
  
@@ -721,28 +834,24 @@ index e0ea5ba..c2a3bb1 100644
 +  return static_cast<int32_t>(index);
 +}
 +
-+// A webcam lists its native size and the halves below it, so the launcher's one
-+// size serves what a page may ask for; nothing is ever listed above it.
++// A phone's camera lists a set of standard sizes. The virtual one lists its
++// native size and every standard size inside it; the page's frames are cropped
++// and resized in the parent to whichever one it picks.
 +bool HeroCapability(uint32_t aNumber, VideoCaptureCapability& aCapability) {
 +  uint32_t width = 0;
 +  uint32_t height = 0;
 +  HeroCameraPipe::SourceSize(&width, &height);
-+  uint32_t found = 0;
-+  for (uint32_t shift = 0; shift < 4; ++shift) {
-+    const uint32_t w = (width >> shift) & ~1u;
-+    const uint32_t h = (height >> shift) & ~1u;
-+    if (w < 160 || h < 90) {
-+      break;
-+    }
-+    if (found++ == aNumber) {
-+      aCapability.width = static_cast<int32_t>(w);
-+      aCapability.height = static_cast<int32_t>(h);
-+      aCapability.maxFPS = static_cast<int32_t>(HeroCameraPipe::SourceFps());
-+      aCapability.videoType = VideoType::kI420;
-+      return true;
-+    }
++  mozilla::hero_camera::Size size{};
++  if (!mozilla::hero_camera::NthCapabilitySize(static_cast<int32_t>(width),
++                                               static_cast<int32_t>(height),
++                                               aNumber, &size)) {
++    return false;
 +  }
-+  return false;
++  aCapability.width = size.width;
++  aCapability.height = size.height;
++  aCapability.maxFPS = static_cast<int32_t>(HeroCameraPipe::SourceFps());
++  aCapability.videoType = VideoType::kI420;
++  return true;
 +}
 +
 +}  // namespace
@@ -773,7 +882,7 @@ index e0ea5ba..c2a3bb1 100644
    if (aDeviceNumber != 0) {
      return -1;
    }
-@@ -27,6 +89,17 @@ int32_t DeviceInfoFake::GetDeviceName(
+@@ -27,6 +86,17 @@ int32_t DeviceInfoFake::GetDeviceName(
  }
  
  int32_t DeviceInfoFake::NumberOfCapabilities(const char* aDeviceUniqueIdUTF8) {
@@ -791,7 +900,7 @@ index e0ea5ba..c2a3bb1 100644
    if (strcmp(aDeviceUniqueIdUTF8, kId) == 0) {
      return 2;
    }
-@@ -36,6 +109,12 @@ int32_t DeviceInfoFake::NumberOfCapabilities(const char* aDeviceUniqueIdUTF8) {
+@@ -36,6 +106,12 @@ int32_t DeviceInfoFake::NumberOfCapabilities(const char* aDeviceUniqueIdUTF8) {
  int32_t DeviceInfoFake::GetCapability(const char* aDeviceUniqueIdUTF8,
                                        const uint32_t aDeviceCapabilityNumber,
                                        VideoCaptureCapability& aCapability) {
@@ -1117,10 +1226,18 @@ index eefae5b..940f78e 100644
        return MakeRefPtr<MediaEngineFakeAudioSource>();
      default:
 diff --git a/dom/media/webrtc/MediaEngineRemoteVideoSource.cpp b/dom/media/webrtc/MediaEngineRemoteVideoSource.cpp
-index c7878d0..8bd8fab 100644
+index c7878d0..c34debe 100644
 --- a/dom/media/webrtc/MediaEngineRemoteVideoSource.cpp
 +++ b/dom/media/webrtc/MediaEngineRemoteVideoSource.cpp
-@@ -66,6 +66,14 @@ static Maybe<VideoFacingModeEnum> GetFacingMode(const nsString& aDeviceName) {
+@@ -6,6 +6,7 @@
+ 
+ #include "CamerasChild.h"
+ #include "ImageContainer.h"
++#include "MaskConfig.hpp"
+ #include "MediaManager.h"
+ #include "MediaTrackConstraints.h"
+ #include "PerformanceRecorder.h"
+@@ -66,6 +67,14 @@ static Maybe<VideoFacingModeEnum> GetFacingMode(const nsString& aDeviceName) {
    }
  #endif  // ANDROID
  #ifdef XP_WIN
@@ -1135,6 +1252,22 @@ index c7878d0..8bd8fab 100644
    // The cameras' name of Surface book are "Microsoft Camera Front" and
    // "Microsoft Camera Rear" respectively.
  
+@@ -187,6 +196,15 @@ MediaEngineRemoteVideoSource::MediaEngineRemoteVideoSource(
+     // Only cameras can have a facing mode.
+     Maybe<VideoFacingModeEnum> facingMode =
+         GetFacingMode(mMediaDevice->mRawName);
++    if (facingMode.isNothing() && MaskConfig::GetString("camera.profile")) {
++      // Hero Browser: the identity's webcams are camou-cam-0 (back) and
++      // camou-cam-1 (front), whatever their labels say.
++      if (mMediaDevice->mRawID.EqualsLiteral("camou-cam-0")) {
++        facingMode = Some(VideoFacingModeEnum::Environment);
++      } else if (mMediaDevice->mRawID.EqualsLiteral("camou-cam-1")) {
++        facingMode = Some(VideoFacingModeEnum::User);
++      }
++    }
+     if (facingMode.isSome()) {
+       mFacingMode.emplace(
+           NS_ConvertASCIItoUTF16(dom::GetEnumString(*facingMode)));
 diff --git a/dom/media/webrtc/MediaEngineWebRTC.cpp b/dom/media/webrtc/MediaEngineWebRTC.cpp
 index d915abb..9211f2b 100644
 --- a/dom/media/webrtc/MediaEngineWebRTC.cpp
