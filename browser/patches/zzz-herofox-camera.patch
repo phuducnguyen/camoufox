@@ -251,10 +251,10 @@ index 7431ded..cb6abb9 100644
  
 diff --git a/dom/media/systemservices/HeroCameraPipe.cpp b/dom/media/systemservices/HeroCameraPipe.cpp
 new file mode 100644
-index 0000000..834ae9c
+index 0000000..c95a04c
 --- /dev/null
 +++ b/dom/media/systemservices/HeroCameraPipe.cpp
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,310 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this file,
 + * You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -472,9 +472,10 @@ index 0000000..834ae9c
 +
 +#ifdef XP_WIN
 +/*static*/ void HeroCameraPipe::ReadLoopTrampoline(void* aArg) {
-+  // Adopts the reference Start() took for the reader.
-+  RefPtr<HeroCameraPipe> self = dont_AddRef(static_cast<HeroCameraPipe*>(aArg));
++  // Runs on the reference Start() took for the reader and gives it back at the end.
++  HeroCameraPipe* self = static_cast<HeroCameraPipe*>(aArg);
 +  self->ReadLoop();
++  self->Release();
 +}
 +
 +void HeroCameraPipe::ReadLoop() {
