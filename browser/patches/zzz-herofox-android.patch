@@ -1,0 +1,127 @@
+diff --git a/layout/base/nsLayoutUtils.cpp b/layout/base/nsLayoutUtils.cpp
+--- a/layout/base/nsLayoutUtils.cpp
++++ b/layout/base/nsLayoutUtils.cpp
+@@ -9930,4 +9930,15 @@
+     aStyle.systemFont = true;
+     return;
+   }
++  if (aOS == MaskConfig::SpoofedOS::Android) {
++    // Android's system face. Firefox for Android resolves every CSS2 system
++    // font keyword to the platform UI font, Roboto; the size is the default
++    // 16sp at a density-independent scale. CreepJS reads this family from
++    // getComputedStyle() and attributes it to an OS, so a Linux family here
++    // ("Ubuntu") marks the identity as Linux, not Android.
++    aName = u"Roboto"_ns;
++    aStyle.size = 16.0f;
++    aStyle.systemFont = true;
++    return;
++  }
+   if (aOS == MaskConfig::SpoofedOS::Linux) {
+diff --git a/layout/style/nsMediaFeatures.cpp b/layout/style/nsMediaFeatures.cpp
+--- a/layout/style/nsMediaFeatures.cpp
++++ b/layout/style/nsMediaFeatures.cpp
+@@ -193,6 +193,14 @@
+   // introducing precision error from conversion to and from less-used
+   // physical units like inches.
+   nsPresContext* pc = aDocument->GetPresContext();
++  // Camoufox: the launch config pins window.devicePixelRatio; the resolution
++  // media feature (and (min-/max-)resolution, the dppx aliases) has to report
++  // the same ratio or a detector sees the two disagree ("lied dpr"). Zoom is
++  // applied the way nsGlobalWindowInner::GetDevicePixelRatio applies it.
++  if (auto dpr = MaskConfig::GetDouble("window.devicePixelRatio");
++      dpr && *dpr > 0) {
++    return static_cast<float>(*dpr) / (pc ? pc->GetFullZoom() : 1.0f);
++  }
+   if (!pc) {
+     return 1.;
+   }
+diff --git a/gfx/thebes/gfxPlatformFontList.cpp b/gfx/thebes/gfxPlatformFontList.cpp
+--- a/gfx/thebes/gfxPlatformFontList.cpp
++++ b/gfx/thebes/gfxPlatformFontList.cpp
+@@ -2243,6 +2243,7 @@
+ #ifndef XP_WIN
+     case SpoofedOS::Windows:
+ #endif
++    case SpoofedOS::Android:
+     case SpoofedOS::Linux:
+       return os;
+     default:
+@@ -2259,6 +2260,11 @@
+       return;
+     case MaskConfig::SpoofedOS::Windows:
+       *aFamilies.AppendElement() = "Segoe UI"_ns;
++      return;
++    case MaskConfig::SpoofedOS::Android:
++      // Firefox for Android's system-ui face; the CSS2 keywords are in
++      // the same patch.
++      *aFamilies.AppendElement() = "Roboto"_ns;
+       return;
+     case MaskConfig::SpoofedOS::Linux:
+       // The GTK interface font of a stock Ubuntu desktop; see
+diff --git a/gfx/thebes/gfxPlatformFontList.h b/gfx/thebes/gfxPlatformFontList.h
+--- a/gfx/thebes/gfxPlatformFontList.h
++++ b/gfx/thebes/gfxPlatformFontList.h
+@@ -1068,7 +1068,7 @@
+   // MaskConfig::SpoofedOS (GetPrefFontsLangGroupLocked).
+   std::array<mozilla::RangedArray<mozilla::UniquePtr<PrefFontList>,
+                                   eFontPrefLang_First, eFontPrefLang_Count>,
+-             5>
++             6>
+       mSpoofedSystemUIPrefFonts MOZ_GUARDED_BY(mLock);
+ 
+   // When system-wide font lookup fails for a character, cache it to skip future
+diff --git a/dom/base/nsScreen.cpp b/dom/base/nsScreen.cpp
+index 2b72572..b133e7e 100644
+--- a/dom/base/nsScreen.cpp
++++ b/dom/base/nsScreen.cpp
+@@ -247,21 +247,18 @@ CSSIntRect nsScreen::GetAvailRect() {
+     }
+     return CSSIntRect::FromAppUnitsRounded(context->GetClientRect());
+   }();
+-  if (availFromResolution || detached) {
++  if (detached) {
+     return stock;
+   }
+-  // Camoufox: the per-context API sets one size, so the available rect is the
+-  // whole screen. That matches the generated fingerprints, whose availWidth /
+-  // availHeight equal width / height, and keeps availWidth <= width true.
++  // HeroFox: a per-context size or a recorded work area is the authority,
++  // even when the RFP path below would otherwise compute a stock offset.
+   if (uint32_t w = 0, h = 0; ScreenDimensionManager::GetDimensions(
+           RoverfoxStorageManager::UserContextId(GetOwnerWindow()), w, h)) {
+     return {0, 0, static_cast<int32_t>(w), static_cast<int32_t>(h)};
+   }
+-  // Camoufox: report the spoofed available screen rect from the injected
+-  // config.
+-  auto rect = MaskConfig::GetRect("screen.availLeft", "screen.availTop",
+-                                  "screen.availWidth", "screen.availHeight");
+-  if (rect.has_value()) {
++  if (auto rect = MaskConfig::GetRect("screen.availLeft", "screen.availTop",
++                                      "screen.availWidth", "screen.availHeight");
++      rect.has_value()) {
+     auto values = rect.value();
+     return {values[0], values[1], values[2], values[3]};
+   }
+diff --git a/toolkit/components/resistfingerprinting/nsRFPService.cpp b/toolkit/components/resistfingerprinting/nsRFPService.cpp
+index 93c024b..bd184d3 100644
+--- a/toolkit/components/resistfingerprinting/nsRFPService.cpp
++++ b/toolkit/components/resistfingerprinting/nsRFPService.cpp
+@@ -3222,11 +3222,13 @@ CSSIntRect nsRFPService::GetSpoofedScreenAvailSize(const nsRect& aRect,
+   }
+   const bool isWindows = aOS == MaskConfig::SpoofedOS::Windows;
+   const bool isMac = aOS == MaskConfig::SpoofedOS::MacOS;
+-  // Linux, Android and other platforms have no offset.
+-  int spoofedHeightOffset = aIsFullscreen ? 0
+-                            : isWindows   ? 48
+-                            : isMac       ? 76
+-                                          : 0;
++  // A Linux desktop reserves the GTK top bar; Android and others have none.
++  const bool isLinuxDesktop = aOS == MaskConfig::SpoofedOS::Linux;
++  int spoofedHeightOffset = aIsFullscreen    ? 0
++                            : isWindows      ? 48
++                            : isMac          ? 76
++                            : isLinuxDesktop ? 27
++                                             : 0;
+   spoofedHeightOffset =
+       NS_lround(float(spoofedHeightOffset) / aScale * AppUnitsPerCSSPixel());
+ 

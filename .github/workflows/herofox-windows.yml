@@ -76,6 +76,37 @@ jobs:
           python3 -m pip install -e ../python
           python3 scripts/verify-fonts.py
 
+      # The Android identity lists eight AOSP families the bundle does not ship. A file
+      # dropped into the built fonts/ afterwards is not activated, so they have to be in
+      # the bundle before packaging. Copy into every per-OS group; package.py dedupes by
+      # content when it flattens the groups for Windows.
+      - name: Add the AOSP fonts the Android identity lists
+        working-directory: browser
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hf-fonts
+          base=https://raw.githubusercontent.com
+          curl -fsSL -o /tmp/hf-fonts/DroidSansMono.ttf \
+            "$base/aosp-mirror/platform_frameworks_base/android-14.0.0_r1/data/fonts/DroidSansMono.ttf"
+          curl -fsSL -o /tmp/hf-fonts/CutiveMono-Regular.ttf \
+            "$base/google/fonts/main/ofl/cutivemono/CutiveMono-Regular.ttf"
+          curl -fsSL -o /tmp/hf-fonts/ComingSoon-Regular.ttf \
+            "$base/google/fonts/main/apache/comingsoon/ComingSoon-Regular.ttf"
+          curl -fsSL -o /tmp/hf-fonts/DancingScript.ttf \
+            "$base/google/fonts/main/ofl/dancingscript/DancingScript%5Bwght%5D.ttf"
+          curl -fsSL -o /tmp/hf-fonts/CarroisGothicSC-Regular.ttf \
+            "$base/google/fonts/main/ofl/carroisgothicsc/CarroisGothicSC-Regular.ttf"
+          curl -fsSL -o /tmp/hf-fonts/NotoSansCJK-Regular.ttc \
+            "$base/notofonts/noto-cjk/main/Sans/OTC/NotoSansCJK-Regular.ttc"
+          groups=0
+          for d in bundle/fonts/*/; do
+            [ -d "$d" ] || continue
+            cp /tmp/hf-fonts/* "$d"
+            groups=$((groups + 1))
+          done
+          test "$groups" -gt 0
+          echo "added the AOSP fonts to $groups bundle group(s)"
+
       - name: Prepare the source tree
         run: python3 -m ci.run_prepare
 
